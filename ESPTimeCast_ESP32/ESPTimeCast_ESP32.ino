@@ -77,6 +77,9 @@ unsigned long messageStartTime = 0;
 int currentScrollCount = 0;
 int currentDisplayCycleCount = 0;
 
+// Display time offset (minutes) - configurable via web UI
+int timeOffsetMinutes = 0;
+
 // Dimming
 bool dimmingEnabled = false;
 bool displayOffByDimming = false;
@@ -228,6 +231,7 @@ void loadConfig() {
     doc[F("weatherDuration")] = 5000;
     doc[F("timeZone")] = "";
     doc[F("language")] = "en";
+    doc[F("timeOffsetMinutes")] = 0;
     doc[F("brightness")] = brightness;
     doc[F("flipDisplay")] = flipDisplay;
     doc[F("twelveHourToggle")] = twelveHourToggle;
@@ -307,6 +311,7 @@ void loadConfig() {
   brightness = doc["brightness"] | 7;
   flipDisplay = doc["flipDisplay"] | false;
   twelveHourToggle = doc["twelveHourToggle"] | false;
+  timeOffsetMinutes = doc["timeOffsetMinutes"] | 0;
   showDayOfWeek = doc["showDayOfWeek"] | true;
   showDate = doc["showDate"] | false;
   showHumidity = doc["showHumidity"] | false;
@@ -780,6 +785,7 @@ void setupWebServer() {
         if (v == "Off" || v == "off") doc[n] = -1;
         else doc[n] = v.toInt();
       } else if (n == "showWeatherDescription") doc[n] = (v == "true" || v == "on" || v == "1");
+      else if (n == "timeOffsetMinutes") doc[n] = v.toInt();
       else if (n == "dimmingEnabled") doc[n] = (v == "true" || v == "on" || v == "1");
       else if (n == "weatherUnits") doc[n] = v;
 
@@ -2739,17 +2745,21 @@ void loop() {
   }
 
   const char *const *daysOfTheWeek = getDaysOfWeek(language);
-  const char *daySymbol = daysOfTheWeek[timeinfo.tm_wday];
+  // For display only, apply configurable minute offset (keeps internal logic like dimming unaffected)
+  time_t display_time = now_time + (timeOffsetMinutes * 60);
+  struct tm displayTimeinfo;
+  localtime_r(&display_time, &displayTimeinfo);
 
+  const char *daySymbol = daysOfTheWeek[displayTimeinfo.tm_wday];
 
-  // build base HH:MM first ---
+  // build base HH:MM first (from adjusted display time) ---
   char baseTime[9];
   if (twelveHourToggle) {
-    int hour12 = timeinfo.tm_hour % 12;
+    int hour12 = displayTimeinfo.tm_hour % 12;
     if (hour12 == 0) hour12 = 12;
-    sprintf(baseTime, "%d:%02d", hour12, timeinfo.tm_min);
+    sprintf(baseTime, "%d:%02d", hour12, displayTimeinfo.tm_min);
   } else {
-    sprintf(baseTime, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+    sprintf(baseTime, "%02d:%02d", displayTimeinfo.tm_hour, displayTimeinfo.tm_min);
   }
 
   // add seconds only if colon blink enabled AND weekday hidden ---
@@ -2758,7 +2768,7 @@ void loop() {
     // Remove any leading space from baseTime
     const char *trimmedBase = baseTime;
     if (baseTime[0] == ' ') trimmedBase++;  // skip leading space
-    sprintf(timeWithSeconds, "%s:%02d", trimmedBase, timeinfo.tm_sec);
+    sprintf(timeWithSeconds, "%s:%02d", trimmedBase, displayTimeinfo.tm_sec);
   } else {
     strcpy(timeWithSeconds, baseTime);  // no seconds
   }

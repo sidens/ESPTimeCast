@@ -198,6 +198,22 @@ Click the **cog icon** next to “Advanced Settings” in the Web UI to reveal e
 &nbsp;
 ## 📝 Configuration Notes
 
+### Time Offset (minutes)
+
+- You can shift the displayed clock forward or backward by a small minute offset for presentation or testing.
+
+- Where: available in the web UI under **Clock Settings → Time Offset (minutes)**.
+
+- Range: -60 to +60 (minutes). A value of `3` will display the clock 3 minutes ahead.
+
+- Behavior: this offset only affects the text shown on the matrix display; internal logic (dimming, countdown target checks, sunrise/sunset calculations) continues to use the real system time.
+
+- How to use:
+  1. Open the device web UI.
+  2. In **Clock Settings**, set **Time Offset (minutes)** to the desired value (e.g. `3`).
+  3. Save settings and allow the device to reboot.
+  4. Confirm the matrix display shows the adjusted time.
+
 - **OpenWeatherMap API Key:**
    - [Make an account here](https://home.openweathermap.org/users/sign_up)
    - [Check your API key here](https://home.openweathermap.org/api_keys)

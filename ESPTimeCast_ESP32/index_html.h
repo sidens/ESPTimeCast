@@ -423,6 +423,10 @@ textarea::placeholder {
   <option value="Etc/GMT-1">Etc/GMT-1</option>
   </select>
 
+    <label for="timeOffsetMinutes">Time Offset (minutes)</label>
+    <input type="number" id="timeOffsetMinutes" name="timeOffsetMinutes" min="-60" max="60" step="1" value="0" />
+    <label class="small">Adjust displayed clock by this many minutes (positive or negative)</label>
+
     <label for="language">Language (Day & Weather)</label>
   <select id="language" name="language" onchange="setLanguage(this.value)">
     <option value="" disabled selected>Select language</option>
@@ -881,6 +885,8 @@ window.onload = function () {
     } else {
       document.getElementById('timeZone').value = data.timeZone;
     }
+    // Time offset (minutes)
+    document.getElementById('timeOffsetMinutes').value = (typeof data.timeOffsetMinutes !== 'undefined') ? data.timeOffsetMinutes : 0;
   })
   .catch(err => {
     console.error('Failed to load config:', err);

@@ -182,6 +182,11 @@ static unsigned long subwayScrollEndTime = 0;
 const unsigned long subwayDuration = 3000;
 const unsigned long subwayScrollPause = 300;
 
+void resetSubwayState() {
+  subwayStartTime = 0;
+  subwayScrolling = false;
+  subwayScrollEndTime = 0;
+}
 // --- Safe WiFi credential and API getters ---
 const char *getSafeSsid() {
   if (isAPMode && strlen(ssid) == 0) {

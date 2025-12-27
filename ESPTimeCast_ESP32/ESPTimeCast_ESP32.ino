@@ -1158,11 +1158,13 @@ void setupWebServer() {
   });
 
   server.on("/set_subway_enabled", HTTP_POST, [](AsyncWebServerRequest *request) {
-    bool enabled = false;
-    if (request->hasParam("value", true)) {
-      String v = request->getParam("value", true)->value();
-      enabled = (v == "1" || v == "true" || v == "on");
+    if (!request->hasParam("value", true)) {
+      request->send(400, "application/json", "{\"error\":\"Missing value\"}");
+      return;
     }
+
+    String v = request->getParam("value", true)->value();
+    bool enabled = (v == "1" || v == "true" || v == "on");
 
     if (subwayEnabled == true && enabled == false) {
       Serial.println(F("[WEBSERVER] subwayEnabled toggled OFF. Checking display mode..."));

@@ -178,7 +178,7 @@ All POST endpoints save to config and trigger `saveConfig()`:
 
 ## Common Tasks
 ### Adding New Display Mode
-1. Define new `displayMode` value (currently 0-6 used; next = 7)
+1. Define new `displayMode` value (currently 0-7 used; next = 8)
 2. Add case in main loop `loop()` function
 3. Initialize mode state in `advanceDisplayMode()` (reset timers, `lastSwitch`, scroll counters)
 4. Add logic to `P.displayAnimate()` or `P.displayText()` calls

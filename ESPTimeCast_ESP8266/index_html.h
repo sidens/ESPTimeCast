@@ -793,6 +793,7 @@ window.onload = function () {
     document.getElementById('showHumidity').checked = !!data.showHumidity;
     document.getElementById('colonBlinkEnabled').checked = !!data.colonBlinkEnabled;
     document.getElementById('showWeatherDescription').checked = !!data.showWeatherDescription;
+    document.getElementById('subwayEnabled').checked = !!data.subwayEnabled;
 
     // --- Dimming Controls ---
     const autoDimmingEl = document.getElementById('autoDimmingEnabled');
@@ -977,6 +978,7 @@ async function submitConfig(event) {
   }
   formData.set('dimBrightness', document.getElementById('dimBrightness').value);
   formData.set('showWeatherDescription', document.getElementById('showWeatherDescription').checked ? 'on' : '');
+  formData.set('subwayEnabled', document.getElementById('subwayEnabled').checked ? 'on' : '');
   formData.set('weatherUnits', document.getElementById('weatherUnits').checked ? 'imperial' : 'metric');
 
   // --- NEW: Countdown Form Data ---

@@ -3041,6 +3041,9 @@ void loop() {
   if (displayMode == 7 && subwayEnabled) {
     // Use dynamic text from HA if available, otherwise use placeholder
     String subway = (subwayText.length() > 0) ? subwayText : String(SUBWAY_PLACEHOLDER);
+    
+    // Normalize to uppercase ASCII (same as weather description)
+    subway = normalizeWeatherDescription(subway);
 
     // Match description padding behavior when coming from humidity-rich weather view
     bool humidityVisible = showHumidity && weatherAvailable && strlen(openWeatherApiKey) == 32 && strlen(openWeatherCity) > 0 && strlen(openWeatherCountry) > 0;
@@ -3077,7 +3080,7 @@ void loop() {
     } else {
       if (subwayStartTime == 0) {
         P.setTextAlignment(PA_CENTER);
-        P.setCharSpacing(1);
+        P.setCharSpacing(0);
         P.print(subwayBuffer);
         subwayStartTime = millis();
       }

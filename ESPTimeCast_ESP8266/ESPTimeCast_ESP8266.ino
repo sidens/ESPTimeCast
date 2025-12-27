@@ -1160,6 +1160,10 @@ void setupWebServer() {
       Serial.println(F("[WEBSERVER] subwayEnabled toggled OFF. Checking display mode..."));
       if (displayMode == 7) {
         Serial.println(F("[WEBSERVER] Currently in Subway mode. Forcing mode advance/cleanup."));
+        // Reset subway variables before advancing
+        subwayStartTime = 0;
+        subwayScrolling = false;
+        subwayScrollEndTime = 0;
         advanceDisplayMode();
       }
     }
@@ -2618,6 +2622,15 @@ void advanceDisplayMode() {
     displayMode = 6;
     Serial.println(F("[DISPLAY] Custom Message display before returning to CLOCK"));
   }
+
+  // Reset subway mode variables when leaving subway mode
+  if (oldMode == 7 && displayMode != 7) {
+    subwayStartTime = 0;
+    subwayScrolling = false;
+    subwayScrollEndTime = 0;
+    Serial.println(F("[DISPLAY] Subway mode variables reset (left subway mode)"));
+  }
+
   lastSwitch = millis();
 }
 

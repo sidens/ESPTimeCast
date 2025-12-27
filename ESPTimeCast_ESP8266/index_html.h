@@ -581,6 +581,14 @@ textarea::placeholder {
       </label>
 
       <label style="display: flex; align-items: center; margin-top: 1.75rem; justify-content: space-between;">
+        <span style="margin-right: 0.5em;">Show Subway Status:</span>
+        <span class="toggle-switch">
+          <input type="checkbox" id="subwayEnabled" name="subwayEnabled" onchange="setSubwayEnabled(this.checked)">
+          <span class="toggle-slider"></span>
+        </span>
+      </label>
+
+      <label style="display: flex; align-items: center; margin-top: 1.75rem; justify-content: space-between;">
         <span style="margin-right: 0.5em;">Flip Display (180°):</span>
         <span class="toggle-switch">
           <input type="checkbox" id="flipDisplay" name="flipDisplay" onchange="setFlipDisplay(this.checked)">
@@ -1317,6 +1325,14 @@ function setLanguage(val) {
 
 function setShowWeatherDescription(val) {
   fetch('/set_weatherdesc', {
+    method: 'POST',
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: "value=" + (val ? 1 : 0)
+  });
+}
+
+function setSubwayEnabled(val) {
+  fetch('/set_subway_enabled', {
     method: 'POST',
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: "value=" + (val ? 1 : 0)

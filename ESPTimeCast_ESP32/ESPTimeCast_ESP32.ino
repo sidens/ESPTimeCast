@@ -125,11 +125,12 @@ bool shouldFetchWeatherNow = false;
 
 unsigned long lastSwitch = 0;
 unsigned long lastColonBlink = 0;
-int displayMode = 0;  // 0: Clock, 1: Weather, 2: Weather Description, 3: Countdown
+int displayMode = 0;  // 0: Clock, 1: Weather, 2: Weather Description, 3: Countdown, 4: Nightscout, 5: Date, 6: Custom Message, 7: Subway (placeholder)
 int prevDisplayMode = -1;
 bool clockScrollDone = false;
 int currentHumidity = -1;
 bool ntpSyncSuccessful = false;
+bool subwayEnabled = true;  // subway placeholder mode toggle
 
 // NTP Synchronization State Machine
 enum NtpState {
@@ -171,6 +172,14 @@ bool descScrolling = false;
 const unsigned long descriptionDuration = 3000;    // 3s for short text
 static unsigned long descScrollEndTime = 0;        // for post-scroll delay (re-used for scroll timing)
 const unsigned long descriptionScrollPause = 300;  // 300ms pause after scroll
+
+// Subway placeholder Mode handling (mirrors weather description behavior)
+const char SUBWAY_PLACEHOLDER[] = "G: Good Service";
+unsigned long subwayStartTime = 0;
+bool subwayScrolling = false;
+static unsigned long subwayScrollEndTime = 0;
+const unsigned long subwayDuration = 3000;
+const unsigned long subwayScrollPause = 300;
 
 // --- Safe WiFi credential and API getters ---
 const char *getSafeSsid() {
@@ -317,6 +326,7 @@ void loadConfig() {
   showHumidity = doc["showHumidity"] | false;
   colonBlinkEnabled = doc.containsKey("colonBlinkEnabled") ? doc["colonBlinkEnabled"].as<bool>() : true;
   showWeatherDescription = doc["showWeatherDescription"] | false;
+  subwayEnabled = doc["subwayEnabled"] | true;
 
   // --- Dimming settings ---
   if (doc["dimmingEnabled"].is<bool>()) {
@@ -785,6 +795,7 @@ void setupWebServer() {
         if (v == "Off" || v == "off") doc[n] = -1;
         else doc[n] = v.toInt();
       } else if (n == "showWeatherDescription") doc[n] = (v == "true" || v == "on" || v == "1");
+      else if (n == "subwayEnabled") doc[n] = (v == "true" || v == "on" || v == "1");
       else if (n == "timeOffsetMinutes") doc[n] = v.toInt();
       else if (n == "dimmingEnabled") doc[n] = (v == "true" || v == "on" || v == "1");
       else if (n == "weatherUnits") doc[n] = v;
@@ -1137,6 +1148,26 @@ void setupWebServer() {
 
     showWeatherDescription = showDesc;
     Serial.printf("[WEBSERVER] Set Show Weather Description to %d\n", showWeatherDescription);
+    request->send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/set_subway_enabled", HTTP_POST, [](AsyncWebServerRequest *request) {
+    bool enabled = false;
+    if (request->hasParam("value", true)) {
+      String v = request->getParam("value", true)->value();
+      enabled = (v == "1" || v == "true" || v == "on");
+    }
+
+    if (subwayEnabled == true && enabled == false) {
+      Serial.println(F("[WEBSERVER] subwayEnabled toggled OFF. Checking display mode..."));
+      if (displayMode == 7) {
+        Serial.println(F("[WEBSERVER] Currently in Subway mode. Forcing mode advance/cleanup."));
+        advanceDisplayMode();
+      }
+    }
+
+    subwayEnabled = enabled;
+    Serial.printf("[WEBSERVER] Set Subway Enabled to %d\n", subwayEnabled);
     request->send(200, "application/json", "{\"ok\":true}");
   });
 
@@ -2160,6 +2191,7 @@ DisplayMode key:
   4: Nightscout
   5: Date
   6: Custom Message
+  7: Subway (placeholder)
 */
 void setup() {
   Serial.begin(115200);
@@ -2364,6 +2396,9 @@ void advanceDisplayMode() {
     if (showWeatherDescription && weatherAvailable && weatherDescription.length() > 0) {
       displayMode = 2;
       Serial.println(F("[DISPLAY] Switching to display mode: DESCRIPTION (from Weather)"));
+    } else if (subwayEnabled) {
+      displayMode = 7;
+      Serial.println(F("[DISPLAY] Switching to display mode: SUBWAY (from Weather, description skipped)"));
     } else if (countdownEnabled && !countdownFinished && ntpSyncSuccessful && countdownTargetTimestamp > 0 && countdownTargetTimestamp > time(nullptr)) {
       displayMode = 3;
       Serial.println(F("[DISPLAY] Switching to display mode: COUNTDOWN (from Weather)"));
@@ -2375,7 +2410,10 @@ void advanceDisplayMode() {
       Serial.println(F("[DISPLAY] Switching to display mode: CLOCK (from Weather)"));
     }
   } else if (displayMode == 2) {  // Weather Description
-    if (countdownEnabled && !countdownFinished && ntpSyncSuccessful && countdownTargetTimestamp > 0 && countdownTargetTimestamp > time(nullptr)) {
+    if (subwayEnabled) {
+      displayMode = 7;
+      Serial.println(F("[DISPLAY] Switching to display mode: SUBWAY (from Description)"));
+    } else if (countdownEnabled && !countdownFinished && ntpSyncSuccessful && countdownTargetTimestamp > 0 && countdownTargetTimestamp > time(nullptr)) {
       displayMode = 3;
       Serial.println(F("[DISPLAY] Switching to display mode: COUNTDOWN (from Description)"));
     } else if (nightscoutConfigured) {
@@ -2396,6 +2434,17 @@ void advanceDisplayMode() {
   } else if (displayMode == 4) {  // Nightscout -> Custom Message
     displayMode = 6;
     Serial.println(F("[DISPLAY] Switching to display mode: CUSTOM MESSAGE (from Nightscout)"));
+  } else if (displayMode == 7) {  // Subway -> Countdown/Nightscout/Clock
+    if (countdownEnabled && !countdownFinished && ntpSyncSuccessful && countdownTargetTimestamp > 0 && countdownTargetTimestamp > time(nullptr)) {
+      displayMode = 3;
+      Serial.println(F("[DISPLAY] Switching to display mode: COUNTDOWN (from Subway)"));
+    } else if (nightscoutConfigured) {
+      displayMode = 4;
+      Serial.println(F("[DISPLAY] Switching to display mode: NIGHTSCOUT (from Subway)"));
+    } else {
+      displayMode = 0;
+      Serial.println(F("[DISPLAY] Switching to display mode: CLOCK (from Subway)"));
+    }
   } else if (displayMode == 6) {  // Custom Message -> Clock
     displayMode = 0;
     Serial.println(F("[DISPLAY] Switching to display mode: CLOCK (from Custom Message)"));
@@ -2412,7 +2461,7 @@ void advanceDisplayMode() {
 
 void advanceDisplayModeSafe() {
   int attempts = 0;
-  const int MAX_ATTEMPTS = 7;  // Number of possible modes + 1
+  const int MAX_ATTEMPTS = 9;  // Number of possible modes + 1 (8 modes total)
   int startMode = displayMode;
   bool valid = false;
   do {
@@ -2430,6 +2479,7 @@ void advanceDisplayModeSafe() {
     else if (displayMode == 3 && countdownEnabled && !countdownFinished && ntpSyncSuccessful) valid = true;
     else if (displayMode == 4 && nightscoutConfigured) valid = true;
     else if (displayMode == 6 && strlen(customMessage) > 0) valid = true;
+    else if (displayMode == 7 && subwayEnabled) valid = true;
 
     // If we've looped back to where we started, break to avoid infinite loop
     if (displayMode == startMode) break;
@@ -2972,6 +3022,59 @@ void loop() {
       }
       if (millis() - descStartTime > descriptionDuration) {
         descStartTime = 0;
+        advanceDisplayMode();
+      }
+      yield();
+      return;
+    }
+  }
+
+
+  // --- SUBWAY Display Mode ---
+  if (displayMode == 7 && subwayEnabled) {
+    String subway = String(SUBWAY_PLACEHOLDER);
+
+    // Match description padding behavior when coming from humidity-rich weather view
+    bool humidityVisible = showHumidity && weatherAvailable && strlen(openWeatherApiKey) == 32 && strlen(openWeatherCity) > 0 && strlen(openWeatherCountry) > 0;
+    bool addPadding = (prevDisplayMode == 1 && humidityVisible);
+    if (addPadding) {
+      subway = "    " + subway;  // 4-space padding before scrolling
+    }
+
+    static char subwayBuffer[96];
+    subway.toCharArray(subwayBuffer, sizeof(subwayBuffer));
+
+    if (subway.length() > 8) {
+      if (!subwayScrolling) {
+        textEffect_t actualScrollDirection = getEffectiveScrollDirection(PA_SCROLL_LEFT, flipDisplay);
+        P.displayScroll(subwayBuffer, PA_CENTER, actualScrollDirection, GENERAL_SCROLL_SPEED);
+        subwayScrolling = true;
+        subwayScrollEndTime = 0;  // reset end time at start
+      }
+      if (P.displayAnimate()) {
+        if (subwayScrollEndTime == 0) {
+          subwayScrollEndTime = millis();  // mark the time when scroll finishes
+        }
+        // wait small pause after scroll stops
+        if (millis() - subwayScrollEndTime > subwayScrollPause) {
+          subwayScrolling = false;
+          subwayScrollEndTime = 0;
+          advanceDisplayMode();
+        }
+      } else {
+        subwayScrollEndTime = 0;  // reset if not finished
+      }
+      yield();
+      return;
+    } else {
+      if (subwayStartTime == 0) {
+        P.setTextAlignment(PA_CENTER);
+        P.setCharSpacing(1);
+        P.print(subwayBuffer);
+        subwayStartTime = millis();
+      }
+      if (millis() - subwayStartTime > subwayDuration) {
+        subwayStartTime = 0;
         advanceDisplayMode();
       }
       yield();

@@ -174,7 +174,8 @@ static unsigned long descScrollEndTime = 0;        // for post-scroll delay (re-
 const unsigned long descriptionScrollPause = 300;  // 300ms pause after scroll
 
 // Subway placeholder Mode handling (mirrors weather description behavior)
-const char SUBWAY_PLACEHOLDER[] = "G: Good Service";
+const char SUBWAY_PLACEHOLDER[] = "No Transit Data";
+String subwayText = "";  // Dynamic text from Home Assistant (empty = use placeholder)
 unsigned long subwayStartTime = 0;
 bool subwayScrolling = false;
 static unsigned long subwayScrollEndTime = 0;
@@ -1165,6 +1166,17 @@ void setupWebServer() {
 
     subwayEnabled = enabled;
     Serial.printf("[WEBSERVER] Set Subway Enabled to %d\n", subwayEnabled);
+    request->send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/set_subway", HTTP_POST, [](AsyncWebServerRequest *request) {
+    String text = "";
+    if (request->hasParam("text", true)) {
+      text = request->getParam("text", true)->value();
+    }
+    
+    subwayText = text;
+    Serial.printf("[WEBSERVER] Set Subway Text to: '%s'\n", subwayText.c_str());
     request->send(200, "application/json", "{\"ok\":true}");
   });
 
@@ -3027,7 +3039,8 @@ void loop() {
 
   // --- SUBWAY Display Mode ---
   if (displayMode == 7 && subwayEnabled) {
-    String subway = String(SUBWAY_PLACEHOLDER);
+    // Use dynamic text from HA if available, otherwise use placeholder
+    String subway = (subwayText.length() > 0) ? subwayText : String(SUBWAY_PLACEHOLDER);
 
     // Match description padding behavior when coming from humidity-rich weather view
     bool humidityVisible = showHumidity && weatherAvailable && strlen(openWeatherApiKey) == 32 && strlen(openWeatherCity) > 0 && strlen(openWeatherCountry) > 0;

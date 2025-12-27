@@ -1329,157 +1329,13 @@ void setupWebServer() {
       String filtered = "";
       for (size_t i = 0; i < msg.length(); i++) {
         char c = msg[i];
-        char c = str.charAt(i);
-        if ((c >= 'A' && c <= 'Z') || c == ' ') result += c;  // keep spaces and uppercase letters only
+        if ((c >= 'A' && c <= 'Z') || c == ' ') {
+          filtered += c;  // keep spaces and uppercase letters only
         }
         // Check for degree symbol (UTF-8 0xC2 0xB0)
         else if ((unsigned char)c == 0xC2 && i + 1 < msg.length() && (unsigned char)msg[i + 1] == 0xB0) {
-
-    // Subway text normalization: allow digits and basic punctuation used in transit strings
-    String normalizeSubwayText(String str) {
-      // Reuse the diacritic replacements from weather normalization
-      str.replace("а", "a");
-      str.replace("б", "b");
-      str.replace("в", "v");
-      str.replace("г", "g");
-      str.replace("д", "d");
-      str.replace("ђ", "dj");
-      str.replace("е", "e");
-      str.replace("ё", "e");  // Russian
-      str.replace("ж", "z");
-      str.replace("з", "z");
-      str.replace("и", "i");
-      str.replace("й", "j");  // Russian
-      str.replace("ј", "j");  // Serbian
-      str.replace("к", "k");
-      str.replace("л", "l");
-      str.replace("љ", "lj");
-      str.replace("м", "m");
-      str.replace("н", "n");
-      str.replace("њ", "nj");
-      str.replace("о", "o");
-      str.replace("п", "p");
-      str.replace("р", "r");
-      str.replace("с", "s");
-      str.replace("т", "t");
-      str.replace("ћ", "c");
-      str.replace("у", "u");
-      str.replace("ф", "f");
-      str.replace("х", "h");
-      str.replace("ц", "c");
-      str.replace("ч", "c");
-      str.replace("џ", "dz");
-      str.replace("ш", "s");
-      str.replace("щ", "sh");  // Russian
-      str.replace("ы", "y");   // Russian
-      str.replace("э", "e");   // Russian
-      str.replace("ю", "yu");  // Russian
-      str.replace("я", "ya");  // Russian
-
-      // Latin diacritics → ASCII
-      str.replace("å", "a");
-      str.replace("ä", "a");
-      str.replace("à", "a");
-      str.replace("á", "a");
-      str.replace("â", "a");
-      str.replace("ã", "a");
-      str.replace("ā", "a");
-      str.replace("ă", "a");
-      str.replace("ą", "a");
-
-      str.replace("æ", "ae");
-
-      str.replace("ç", "c");
-      str.replace("č", "c");
-      str.replace("ć", "c");
-
-      str.replace("ď", "d");
-
-      str.replace("é", "e");
-      str.replace("è", "e");
-      str.replace("ê", "e");
-      str.replace("ë", "e");
-      str.replace("ē", "e");
-      str.replace("ė", "e");
-      str.replace("ę", "e");
-
-      str.replace("ğ", "g");
-      str.replace("ģ", "g");
-
-      str.replace("ĥ", "h");
-
-      str.replace("í", "i");
-      str.replace("ì", "i");
-      str.replace("î", "i");
-      str.replace("ï", "i");
-      str.replace("ī", "i");
-      str.replace("į", "i");
-
-      str.replace("ĵ", "j");
-
-      str.replace("ķ", "k");
-
-      str.replace("ľ", "l");
-      str.replace("ł", "l");
-
-      str.replace("ñ", "n");
-      str.replace("ń", "n");
-      str.replace("ņ", "n");
-
-      str.replace("ó", "o");
-      str.replace("ò", "o");
-      str.replace("ô", "o");
-      str.replace("ö", "o");
-      str.replace("õ", "o");
-      str.replace("ø", "o");
-      str.replace("ō", "o");
-      str.replace("ő", "o");
-
-      str.replace("œ", "oe");
-
-      str.replace("ŕ", "r");
-
-      str.replace("ś", "s");
-      str.replace("š", "s");
-      str.replace("ș", "s");
-      str.replace("ŝ", "s");
-
-      str.replace("ß", "ss");
-
-      str.replace("ť", "t");
-      str.replace("ț", "t");
-
-      str.replace("ú", "u");
-      str.replace("ù", "u");
-      str.replace("û", "u");
-      str.replace("ü", "u");
-      str.replace("ū", "u");
-      str.replace("ů", "u");
-      str.replace("ű", "u");
-
-      str.replace("ŵ", "w");
-
-      str.replace("ý", "y");
-      str.replace("ÿ", "y");
-      str.replace("ŷ", "y");
-
-      str.replace("ž", "z");
-      str.replace("ź", "z");
-      str.replace("ż", "z");
-
-      str.toUpperCase();
-
-      String result = "";
-      for (unsigned int i = 0; i < str.length(); i++) {
-        char c = str.charAt(i);
-        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ' || c == ':' || c == '-' || c == '/') {
-          result += c;  // keep letters, digits, space, colon, dash, slash
-        }
-      }
-      return result;
-    }
           filtered += "°";  // add single character
-          i++;              // skip next byte
+          i++;               // skip next byte
         }
       }
 
@@ -1964,6 +1820,148 @@ String normalizeWeatherDescription(String str) {
   for (unsigned int i = 0; i < str.length(); i++) {
     char c = str.charAt(i);
     if ((c >= 'A' && c <= 'Z') || c == ' ') {
+      result += c;
+    }
+  }
+  return result;
+}
+
+String normalizeSubwayText(String str) {
+  // Reuse transliteration set but keep digits and basic separators for transit strings
+  str.replace("а", "a");
+  str.replace("б", "b");
+  str.replace("в", "v");
+  str.replace("г", "g");
+  str.replace("д", "d");
+  str.replace("ђ", "dj");
+  str.replace("е", "e");
+  str.replace("ё", "e");
+  str.replace("ж", "z");
+  str.replace("з", "z");
+  str.replace("и", "i");
+  str.replace("й", "j");
+  str.replace("ј", "j");
+  str.replace("к", "k");
+  str.replace("л", "l");
+  str.replace("љ", "lj");
+  str.replace("м", "m");
+  str.replace("н", "n");
+  str.replace("њ", "nj");
+  str.replace("о", "o");
+  str.replace("п", "p");
+  str.replace("р", "r");
+  str.replace("с", "s");
+  str.replace("т", "t");
+  str.replace("ћ", "c");
+  str.replace("у", "u");
+  str.replace("ф", "f");
+  str.replace("х", "h");
+  str.replace("ц", "c");
+  str.replace("ч", "c");
+  str.replace("џ", "dz");
+  str.replace("ш", "s");
+  str.replace("щ", "sh");
+  str.replace("ы", "y");
+  str.replace("э", "e");
+  str.replace("ю", "yu");
+  str.replace("я", "ya");
+
+  str.replace("å", "a");
+  str.replace("ä", "a");
+  str.replace("à", "a");
+  str.replace("á", "a");
+  str.replace("â", "a");
+  str.replace("ã", "a");
+  str.replace("ā", "a");
+  str.replace("ă", "a");
+  str.replace("ą", "a");
+
+  str.replace("æ", "ae");
+
+  str.replace("ç", "c");
+  str.replace("č", "c");
+  str.replace("ć", "c");
+
+  str.replace("ď", "d");
+
+  str.replace("é", "e");
+  str.replace("è", "e");
+  str.replace("ê", "e");
+  str.replace("ë", "e");
+  str.replace("ē", "e");
+  str.replace("ė", "e");
+  str.replace("ę", "e");
+
+  str.replace("ğ", "g");
+  str.replace("ģ", "g");
+
+  str.replace("ĥ", "h");
+
+  str.replace("í", "i");
+  str.replace("ì", "i");
+  str.replace("î", "i");
+  str.replace("ï", "i");
+  str.replace("ī", "i");
+  str.replace("į", "i");
+
+  str.replace("ĵ", "j");
+
+  str.replace("ķ", "k");
+
+  str.replace("ľ", "l");
+  str.replace("ł", "l");
+
+  str.replace("ñ", "n");
+  str.replace("ń", "n");
+  str.replace("ņ", "n");
+
+  str.replace("ó", "o");
+  str.replace("ò", "o");
+  str.replace("ô", "o");
+  str.replace("ö", "o");
+  str.replace("õ", "o");
+  str.replace("ø", "o");
+  str.replace("ō", "o");
+  str.replace("ő", "o");
+
+  str.replace("œ", "oe");
+
+  str.replace("ŕ", "r");
+
+  str.replace("ś", "s");
+  str.replace("š", "s");
+  str.replace("ș", "s");
+  str.replace("ŝ", "s");
+
+  str.replace("ß", "ss");
+
+  str.replace("ť", "t");
+  str.replace("ț", "t");
+
+  str.replace("ú", "u");
+  str.replace("ù", "u");
+  str.replace("û", "u");
+  str.replace("ü", "u");
+  str.replace("ū", "u");
+  str.replace("ů", "u");
+  str.replace("ű", "u");
+
+  str.replace("ŵ", "w");
+
+  str.replace("ý", "y");
+  str.replace("ÿ", "y");
+  str.replace("ŷ", "y");
+
+  str.replace("ž", "z");
+  str.replace("ź", "z");
+  str.replace("ż", "z");
+
+  str.toUpperCase();
+
+  String result = "";
+  for (unsigned int i = 0; i < str.length(); i++) {
+    char c = str.charAt(i);
+    if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ' || c == ':' || c == '-' || c == '/') {
       result += c;
     }
   }

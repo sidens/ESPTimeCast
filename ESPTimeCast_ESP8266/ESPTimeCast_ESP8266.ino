@@ -1174,8 +1174,25 @@ void setupWebServer() {
     if (request->hasParam("text", true)) {
       text = request->getParam("text", true)->value();
     }
-    
-    subwayText = text;
+
+    // Normalize subway text: keep printable characters and trim whitespace,
+    // so stored text better matches what will actually be displayed.
+    String normalized = "";
+    normalized.reserve(text.length());
+    for (size_t i = 0; i < text.length(); i++) {
+      char c = text.charAt(i);
+      // Map common control whitespace to a space
+      if (c == '\r' || c == '\n' || c == '\t') {
+        c = ' ';
+      }
+      // Keep standard printable ASCII characters
+      if (c >= 32 && c <= 126) {
+        normalized += c;
+      }
+    }
+    normalized.trim();
+
+    subwayText = normalized;
     Serial.printf("[WEBSERVER] Set Subway Text to: '%s'\n", subwayText.c_str());
     request->send(200, "application/json", "{\"ok\":true}");
   });

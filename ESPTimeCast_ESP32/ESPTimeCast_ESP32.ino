@@ -3187,11 +3187,20 @@ void loop() {
   // --- SUBWAY Display Mode ---
   if (displayMode == 7 && subwayEnabled) {
     // Use dynamic text from HA if available, otherwise use placeholder
-    String subway = (subwayText.length() > 0) ? subwayText : String(SUBWAY_PLACEHOLDER);
+    // Cache normalized subway text so we only perform the expensive
+    // normalizeSubwayText() operation when the underlying text changes.
+    static String lastSubwaySource;
+    static String cachedNormalizedSubway;
 
-    // Normalize for subway text (keeps digits, colon, dash, slash)
-    subway = normalizeSubwayText(subway);
+    String subwaySource = (subwayText.length() > 0) ? subwayText : String(SUBWAY_PLACEHOLDER);
 
+    if (subwaySource != lastSubwaySource) {
+      // Normalize for subway text (keeps digits, colon, dash, slash)
+      cachedNormalizedSubway = normalizeSubwayText(subwaySource);
+      lastSubwaySource = subwaySource;
+    }
+
+    String subway = cachedNormalizedSubway;
     // Match description padding behavior when coming from humidity-rich weather view
     bool humidityVisible = showHumidity && weatherAvailable && strlen(openWeatherApiKey) == 32 && strlen(openWeatherCity) > 0 && strlen(openWeatherCountry) > 0;
     bool addPadding = (prevDisplayMode == 1 && humidityVisible);

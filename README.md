@@ -592,6 +592,50 @@ If you'd like to go further, you can also support development through the option
 &nbsp;
 &nbsp;
 
+## 🚇 Subway Mode (Transit Text)
+
+- Display slot: mode 7 in the rotation (after weather/description). Uses live text from the HA endpoint; falls back to the placeholder `No Transit Data` when empty.
+- Toggle: Web UI Advanced setting “Show Subway Status” (maps to `/set_subway_enabled`).
+- Rendering: >8 chars scroll once (honors padding when following weather with humidity), <=8 chars center for 3s, then advance.
+- Normalization: transliterates to ASCII and keeps **A–Z, 0–9, space, colon, dash, slash**; everything else is removed.
+- HA endpoints:
+  - `POST /set_subway_enabled` with `value=on|off`
+  - `POST /set_subway` with `text=<subway string>` (text is normalized as above)
+
+#### Example (curl)
+
+```
+curl -X POST -d "value=on" "http://<device_ip>/set_subway_enabled"
+curl -X POST -d "text=R2 5:12 PM" "http://<device_ip>/set_subway"
+```
+
+## 📜 Custom Message Sanitization (UI + HA)
+
+- Backend sanitizer now keeps **uppercase letters A–Z, spaces, and the degree symbol (°)** only. All digits and punctuation are stripped server-side even if the Web UI input allows them.
+- Parameters remain the same for `POST /set_custom_message`:
+  - `message` (required; empty string clears)
+  - `speed` 10–200
+  - `seconds` 0–3600 (0 uses Weather Duration)
+  - `scrolltimes` 0–100 (0 = infinite)
+- Persistence rules:
+  - Web UI messages are persistent.
+  - HA messages are temporary and restore the UI message after expiry/clear.
+  - HA clear (`message=`) removes only the temporary message; UI clear removes both.
+
+#### Example (curl)
+
+```
+curl -X POST -d "message=HELLO WORLD&speed=60&seconds=15" "http://<device_ip>/set_custom_message"
+```
+
+## 🧭 Developer / Copilot Notes
+
+- Endpoints: `/set_custom_message`, `/set_subway_enabled` (`value=on|off`), `/set_subway` (`text=`). Brightness remains `/set_brightness` (`value 0–15 or -1`).
+- Normalization: `normalizeSubwayText` → uppercase ASCII, keeps A–Z, 0–9, space, colon, dash, slash; used before subway display.
+- Message sanitizer: uppercase letters + spaces + optional degree symbol only; digits/punctuation are dropped server-side.
+- Display order: subway is mode 7, scrolls once when longer than 8 chars; short text centers for 3s. Padding is added when following humid weather view.
+- Parity: ESP32 and ESP8266 sketches share the same subway endpoints, normalization, and sanitization logic.
+
 
       
 

@@ -598,9 +598,10 @@ If you'd like to go further, you can also support development through the option
 - Toggle: Web UI Advanced setting “Show Subway Status” (maps to `/set_subway_enabled`).
 - Rendering: >8 chars scroll once (honors padding when following weather with humidity), <=8 chars center for 3s, then advance.
 - Normalization: transliterates to ASCII and keeps **A–Z, 0–9, space, colon, dash, slash**; everything else is removed.
+- **Persistence**: Both the subway enabled setting and the subway text itself are saved to configuration storage and will persist across device reboots.
 - HA endpoints:
-  - `POST /set_subway_enabled` with `value=on|off`
-  - `POST /set_subway` with `text=<subway string>` (text is normalized as above)
+  - `POST /set_subway_enabled` with `value=on|off` (persisted to config)
+  - `POST /set_subway` with `text=<subway string>` (text is normalized and persisted to config)
 
 #### Example (curl)
 

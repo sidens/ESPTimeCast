@@ -175,7 +175,7 @@ const unsigned long descriptionScrollPause = 300;  // 300ms pause after scroll
 
 // Subway placeholder Mode handling (mirrors weather description behavior)
 const char SUBWAY_PLACEHOLDER[] = "No Transit Data";
-String subwayText = "";  // Dynamic text from Home Assistant (empty = use placeholder)
+char subwayText[121] = "";  // Persistent text from Home Assistant or Web UI (empty = use placeholder)
 unsigned long subwayStartTime = 0;
 bool subwayScrolling = false;
 static unsigned long subwayScrollEndTime = 0;
@@ -327,6 +327,7 @@ void loadConfig() {
   colonBlinkEnabled = doc.containsKey("colonBlinkEnabled") ? doc["colonBlinkEnabled"].as<bool>() : true;
   showWeatherDescription = doc["showWeatherDescription"] | false;
   subwayEnabled = doc["subwayEnabled"] | true;
+  strlcpy(subwayText, doc["subwayText"] | "", sizeof(subwayText));
 
   // --- Dimming settings ---
   if (doc["dimmingEnabled"].is<bool>()) {
@@ -794,6 +795,7 @@ void setupWebServer() {
         else doc[n] = v.toInt();
       } else if (n == "showWeatherDescription") doc[n] = (v == "true" || v == "on" || v == "1");
       else if (n == "subwayEnabled") doc[n] = (v == "true" || v == "on" || v == "1");
+      else if (n == "subwayText") doc[n] = v;
       else if (n == "timeOffsetMinutes") doc[n] = v.toInt();
       else if (n == "dimmingEnabled") doc[n] = (v == "true" || v == "on" || v == "1");
       else if (n == "weatherUnits") doc[n] = v;
@@ -1192,8 +1194,36 @@ void setupWebServer() {
     }
     normalized.trim();
 
-    subwayText = normalized;
-    Serial.printf("[WEBSERVER] Set Subway Text to: '%s'\n", subwayText.c_str());
+    // Save to char array
+    strlcpy(subwayText, normalized.c_str(), sizeof(subwayText));
+    
+    // Persist to config.json
+    DynamicJsonDocument doc(2048);
+    File configFile = LittleFS.open("/config.json", "r");
+    if (configFile) {
+      DeserializationError err = deserializeJson(doc, configFile);
+      configFile.close();
+      if (err) {
+        Serial.print(F("[SUBWAY] Error reading config: "));
+        Serial.println(err.f_str());
+      }
+    }
+    
+    doc["subwayText"] = subwayText;
+    
+    if (LittleFS.exists("/config.json")) {
+      LittleFS.rename("/config.json", "/config.bak");
+    }
+    
+    File f = LittleFS.open("/config.json", "w");
+    if (f) {
+      serializeJson(doc, f);
+      f.close();
+      Serial.printf("[SUBWAY] Subway text saved: '%s'\n", subwayText);
+    } else {
+      Serial.println(F("[SUBWAY] ERROR: Failed to save subway text to config"));
+    }
+    
     request->send(200, "application/json", "{\"ok\":true}");
   });
 
@@ -3199,7 +3229,7 @@ void loop() {
   // --- SUBWAY Display Mode ---
   if (displayMode == 7 && subwayEnabled) {
     // Use dynamic text from HA if available, otherwise use placeholder
-    String subway = (subwayText.length() > 0) ? subwayText : String(SUBWAY_PLACEHOLDER);
+    String subway = (strlen(subwayText) > 0) ? String(subwayText) : String(SUBWAY_PLACEHOLDER);
 
     // Normalize for subway text (keeps digits, colon, dash, slash)
     subway = normalizeSubwayText(subway);

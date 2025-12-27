@@ -1162,19 +1162,21 @@ void setupWebServer() {
     if (request->hasParam("value", true)) {
       String v = request->getParam("value", true)->value();
       enabled = (v == "1" || v == "true" || v == "on");
-    }
 
-    if (subwayEnabled == true && enabled == false) {
-      Serial.println(F("[WEBSERVER] subwayEnabled toggled OFF. Checking display mode..."));
-      if (displayMode == 7) {
-        Serial.println(F("[WEBSERVER] Currently in Subway mode. Forcing mode advance/cleanup."));
-        advanceDisplayMode();
+      if (subwayEnabled == true && enabled == false) {
+        Serial.println(F("[WEBSERVER] subwayEnabled toggled OFF. Checking display mode..."));
+        if (displayMode == 7) {
+          Serial.println(F("[WEBSERVER] Currently in Subway mode. Forcing mode advance/cleanup."));
+          advanceDisplayMode();
+        }
       }
-    }
 
-    subwayEnabled = enabled;
-    Serial.printf("[WEBSERVER] Set Subway Enabled to %d\n", subwayEnabled);
-    request->send(200, "application/json", "{\"ok\":true}");
+      subwayEnabled = enabled;
+      Serial.printf("[WEBSERVER] Set Subway Enabled to %d\n", subwayEnabled);
+      request->send(200, "application/json", "{\"ok\":true}");
+    } else {
+      request->send(400, "application/json", "{\"error\":\"Missing value parameter\"}");
+    }
   });
 
   server.on("/set_subway", HTTP_POST, [](AsyncWebServerRequest *request) {

@@ -246,7 +246,7 @@ void loadConfig() {
     doc[F("flipDisplay")] = flipDisplay;
     doc[F("twelveHourToggle")] = twelveHourToggle;
     doc[F("showDayOfWeek")] = showDayOfWeek;
-    doc[F("showDate")] = false;
+    doc[F("showDate")] = showDate;
     doc[F("showClock")] = showClock;
     doc[F("showHumidity")] = showHumidity;
     doc[F("colonBlinkEnabled")] = colonBlinkEnabled;

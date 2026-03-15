@@ -252,7 +252,7 @@ void loadConfig() {
     doc[F("flipDisplay")] = flipDisplay;
     doc[F("twelveHourToggle")] = twelveHourToggle;
     doc[F("showDayOfWeek")] = showDayOfWeek;
-    doc[F("showDate")] = false;
+    doc[F("showDate")] = showDate;
     doc[F("showClock")] = showClock;
     doc[F("showHumidity")] = showHumidity;
     doc[F("colonBlinkEnabled")] = colonBlinkEnabled;
@@ -344,9 +344,6 @@ void loadConfig() {
     String de = doc["dimmingEnabled"].as<String>();
     dimmingEnabled = (de == "true" || de == "1" || de == "on");
   }
-
-  String de = doc["dimmingEnabled"].as<String>();
-  dimmingEnabled = (de == "true" || de == "on" || de == "1");
 
   dimStartHour = doc["dimStartHour"] | 18;
   dimStartMinute = doc["dimStartMinute"] | 0;

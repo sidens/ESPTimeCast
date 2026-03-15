@@ -907,7 +907,7 @@ If you'd like to go a step further, you can also support development through the
 
 ## 🚇 Subway Mode (Transit Text)
 
-- Display slot: mode 7 in the rotation (after weather/description). Uses live text from the HA endpoint; falls back to the placeholder `No Transit Data` when empty.
+- Display slot: mode 8 in the rotation (after Timer/mode 7). Uses live text from the HA endpoint; falls back to the placeholder `No Transit Data` when empty.
 - Toggle: Web UI Advanced setting “Show Subway Status” (maps to `/set_subway_enabled`).
 - Rendering: >8 chars scroll once (honors padding when following weather with humidity), <=8 chars center for 3s, then advance.
 - Normalization: transliterates to ASCII and keeps **A–Z, 0–9, space, colon, dash, slash**; everything else is removed.
@@ -946,7 +946,7 @@ curl -X POST -d "message=HELLO WORLD&speed=60&seconds=15" "http://<device_ip>/se
 - Endpoints: `/set_custom_message`, `/set_subway_enabled` (`value=on|off`), `/set_subway` (`text=`). Brightness remains `/set_brightness` (`value 0–15 or -1`).
 - Normalization: `normalizeSubwayText` → uppercase ASCII, keeps A–Z, 0–9, space, colon, dash, slash; used before subway display.
 - Message sanitizer: uppercase letters + spaces + optional degree symbol only; digits/punctuation are dropped server-side.
-- Display order: subway is mode 7, scrolls once when longer than 8 chars; short text centers for 3s. Padding is added when following humid weather view.
+- Display order: subway is mode 8 (after Timer/mode 7), scrolls once when longer than 8 chars; short text centers for 3s. Padding is added when following humid weather view.
 - Parity: ESP32 and ESP8266 sketches share the same subway endpoints, normalization, and sanitization logic.
 
 

@@ -13,18 +13,57 @@
 #include <time.h>
 #include <WiFiClientSecure.h>
 #include <ESPmDNS.h>
+#include <Update.h>
+#include "version.h"
 
-#include "mfactoryfont.h"   // Custom font
+// --- FONT HANDLING ---
+#if __has_include("mfactoryfont.h")
+#include "mfactoryfont.h"
+#define USE_CUSTOM_FONT
+#pragma message("ESPTimeCast™: Building with mfactoryfont")
+#else
+#include "basic_font.h"
+#pragma message("ESPTimeCast™: Using Basic Font (fallback)")
+#endif
+
 #include "tz_lookup.h"      // Timezone lookup, do not duplicate mapping here!
 #include "days_lookup.h"    // Languages for the Days of the Week
 #include "months_lookup.h"  // Languages for the Months of the Year
 #include "index_html.h"     // Web UI
 
+// ============================
+// Board-specific MAX7219 pin mapping
+// ============================
+#if defined(CONFIG_IDF_TARGET_ESP32S2)
+// ESP32-S2 Mini
+#define CLK_PIN 7
+#define CS_PIN 11
+#define DATA_PIN 12
+
+#elif defined(CONFIG_IDF_TARGET_ESP32S3)
+// ESP32-S3 WROOM / Camera board
+#define CLK_PIN 18
+#define CS_PIN 16
+#define DATA_PIN 17
+
+#elif defined(CONFIG_IDF_TARGET_ESP32C3)
+// ESP32-C3 Super Mini
+#define CLK_PIN 4
+#define CS_PIN 10
+#define DATA_PIN 6
+
+#elif defined(ESP32)
+// Default ESP32 boards (DevKit, WROOM, etc)
+#define CLK_PIN 18
+#define CS_PIN 23
+#define DATA_PIN 5
+
+#else
+#error "Unsupported board!"
+#endif
+
 #define HARDWARE_TYPE MD_MAX72XX::FC16_HW
 #define MAX_DEVICES 4
-#define CLK_PIN 7    //D5
-#define CS_PIN 11    // D7
-#define DATA_PIN 12  //D8
 
 #ifdef ESP8266
 WiFiEventHandler mConnectHandler;
@@ -37,11 +76,23 @@ AsyncWebServer server(80);
 
 // --- Global Scroll Speed Settings ---
 const int GENERAL_SCROLL_SPEED = 85;  // Default: Adjust this for Weather Description and Countdown Label (e.g., 50 for faster, 200 for slower)
-const int IP_SCROLL_SPEED = 115;      // Default: Adjust this for the IP Address display (slower for readability)
+int IP_SCROLL_SPEED = 115;            // Default: Adjust this for the IP Address display (slower for readability)
 int messageScrollSpeed = 85;          // default fallback
 
 // --- Nightscout setting ---
 const unsigned int NIGHTSCOUT_IDLE_THRESHOLD_MIN = 10;  // minutes before data is considered outdated
+unsigned long lastNightscoutFetchTime = 0;
+const unsigned long NIGHTSCOUT_FETCH_INTERVAL = 150000;  // 2.5 minutes
+int currentGlucose = -1;
+String currentDirection = "?";
+time_t lastGlucoseTime = 0;  // store timestamp from JSON
+bool isNetworkBusy = false;
+
+// --- Device identity ---
+const char *DEFAULT_HOSTNAME = "esptimecast";
+const char *DEFAULT_AP_PASSWORD = "12345678";
+const char *DEFAULT_AP_SSID = "ESPTimeCast";
+String deviceHostname = DEFAULT_HOSTNAME;
 
 // WiFi and configuration globals
 char ssid[32] = "";
@@ -55,6 +106,9 @@ char language[8] = "en";
 unsigned long lastWifiConnectTime = 0;
 String mainDesc = "";
 String detailedDesc = "";
+bool credentialsExist() {
+  return (strlen(ssid) > 0);
+}
 
 // Timing and display settings
 unsigned long clockDuration = 10000;
@@ -95,6 +149,12 @@ int sunriseHour = 6;
 int sunriseMinute = 0;
 int sunsetHour = 18;
 int sunsetMinute = 0;
+bool clockOnlyDuringDimming = false;
+bool configDirty = false;
+unsigned long lastBrightnessChange = 0;
+const unsigned long saveDelay = 1200;  // 1.2 seconds
+int startTotal, endTotal;
+bool dimActive = false;
 
 //Countdown Globals
 bool countdownEnabled = false;
@@ -108,6 +168,11 @@ unsigned long lastUptimeLog = 0;                   // Timer for hourly logging
 const unsigned long uptimeLogInterval = 600000UL;  // 10 minutes in ms
 unsigned long totalUptimeSeconds = 0;              // Persistent accumulated uptime in seconds
 
+// Unified OTA Control Variables
+bool isUpdating = false;         // When true, all background tasks (Weather, NTP, Scroll) stop
+bool pendingRestart = false;     // Flag to trigger a safe reboot in the loop
+unsigned long restartTimer = 0;  // Timer to give the WebServer time to send the final "OK"
+
 // State management
 bool weatherCycleStarted = false;
 WiFiClient client;
@@ -116,17 +181,18 @@ DNSServer dnsServer;
 
 String currentTemp = "";
 String weatherDescription = "";
+String weatherIcon = "";
 bool showWeatherDescription = false;
 bool weatherAvailable = false;
 bool weatherFetched = false;
 bool weatherFetchInitiated = false;
 bool isAPMode = false;
-char tempSymbol = '[';
+char tempSymbol = '\006';
 bool shouldFetchWeatherNow = false;
 
 unsigned long lastSwitch = 0;
 unsigned long lastColonBlink = 0;
-int displayMode = 0;  // 0: Clock, 1: Weather, 2: Weather Description, 3: Countdown, 4: Nightscout, 5: Date, 6: Custom Message, 7: Subway (placeholder)
+int displayMode = 0;  // 0: Clock, 1: Weather, 2: Weather Description, 3: Countdown, 4: Nightscout, 5: Date, 6: Custom Message, 7: Timer, 8: Subway
 int prevDisplayMode = -1;
 bool clockScrollDone = false;
 int currentHumidity = -1;
@@ -159,7 +225,7 @@ bool countdownScrolling = false;
 unsigned long countdownScrollEndTime = 0;
 unsigned long countdownStaticStartTime = 0;  // For last-day static display
 
-// --- NEW GLOBAL VARIABLES FOR IMMEDIATE COUNTDOWN FINISH ---
+// --- Inmediate countdown finish ---
 bool countdownFinished = false;                       // Tracks if the countdown has permanently finished
 bool countdownShowFinishedMessage = false;            // Flag to indicate "TIMES UP" message is active
 unsigned long countdownFinishedMessageStartTime = 0;  // Timer for the 10-second message duration
@@ -174,7 +240,7 @@ const unsigned long descriptionDuration = 3000;    // 3s for short text
 static unsigned long descScrollEndTime = 0;        // for post-scroll delay (re-used for scroll timing)
 const unsigned long descriptionScrollPause = 300;  // 300ms pause after scroll
 
-// Subway placeholder Mode handling (mirrors weather description behavior)
+// Subway placeholder Mode handling (Mode 8)
 const char SUBWAY_PLACEHOLDER[] = "No Transit Data";
 String subwayText = "";  // Dynamic text from Home Assistant (empty = use placeholder)
 unsigned long subwayStartTime = 0;
@@ -188,6 +254,26 @@ void resetSubwayState() {
   subwayScrolling = false;
   subwayScrollEndTime = 0;
 }
+
+// Custom message globals
+bool forceMessageRestart = false;
+bool messageBigNumbers = false;
+bool allowInterrupt = true;
+
+// Custom font for days and months
+bool useCustomFont = true;
+
+// Timer (Mode 7)
+bool timerActive = false;
+int timerSubState = 0;  // 0: Timer Clock, 1: Message
+bool timerPaused = false;
+bool timerFinished = false;
+unsigned long timerRemainingAtPause = 0;
+unsigned long timerOriginalDuration = 0;  // For RESTART command
+unsigned long timerFinishStartTime = 0;
+unsigned long timerEndTime = 0;
+int global_scrolltimes = 0;  // Persisted from HTTP request
+int global_msgSeconds = 0;
 // --- Safe WiFi credential and API getters ---
 const char *getSafeSsid() {
   if (isAPMode && strlen(ssid) == 0) {
@@ -272,6 +358,7 @@ void loadConfig() {
     doc[F("sunriseMinute")] = sunriseMinute;
     doc[F("sunsetHour")] = sunsetHour;
     doc[F("sunsetMinute")] = sunsetMinute;
+    doc[F("clockOnlyDuringDimming")] = false;
 
     // Add countdown defaults when creating a new config.json
     JsonObject countdownObj = doc.createNestedObject("countdown");
@@ -307,6 +394,14 @@ void loadConfig() {
     return;
   }
 
+  bool configChanged = false;
+
+  if (doc.containsKey("hostname")) {
+    deviceHostname = doc["hostname"].as<String>();
+    Serial.print(F("[CONFIG] Loaded hostname: "));
+    Serial.println(deviceHostname);
+  }
+
   strlcpy(ssid, doc["ssid"] | "", sizeof(ssid));
   strlcpy(password, doc["password"] | "", sizeof(password));
   strlcpy(openWeatherApiKey, doc["openWeatherApiKey"] | "", sizeof(openWeatherApiKey));
@@ -326,6 +421,7 @@ void loadConfig() {
   }
 
   brightness = doc["brightness"] | 7;
+  displayOff = doc["displayOff"] | false;
   flipDisplay = doc["flipDisplay"] | false;
   twelveHourToggle = doc["twelveHourToggle"] | false;
   timeOffsetMinutes = doc["timeOffsetMinutes"] | 0;
@@ -381,9 +477,9 @@ void loadConfig() {
   strlcpy(ntpServer2, doc["ntpServer2"] | "time.nist.gov", sizeof(ntpServer2));
 
   if (strcmp(weatherUnits, "imperial") == 0)
-    tempSymbol = ']';
+    tempSymbol = '\007';
   else
-    tempSymbol = '[';
+    tempSymbol = '\006';
 
 
   // --- COUNTDOWN CONFIG LOADING ---
@@ -414,32 +510,66 @@ void loadConfig() {
     Serial.println(F("[CONFIG] Countdown object not found, defaulting to disabled."));
     countdownFinished = false;
   }
+
+  // --- CLOCK-ONLY-DURING-DIMMING LOADING ---
+  if (doc.containsKey("clockOnlyDuringDimming")) {
+    clockOnlyDuringDimming = doc["clockOnlyDuringDimming"].as<bool>();
+  } else {
+    clockOnlyDuringDimming = false;
+    doc["clockOnlyDuringDimming"] = clockOnlyDuringDimming;
+    configChanged = true;
+    Serial.println(F("[CONFIG] Migrated: added clockOnlyDuringDimming default."));
+  }
+
+  // --- Save migrated config if needed ---
+  if (configChanged) {
+    Serial.println(F("[CONFIG] Saving migrated config.json"));
+
+    File f = LittleFS.open("/config.json", "w");
+    if (f) {
+      serializeJsonPretty(doc, f);
+      f.close();
+      Serial.println(F("[CONFIG] Migration saved successfully."));
+    } else {
+      Serial.println(F("[ERROR] Failed to save migrated config.json"));
+    }
+  }
+
   Serial.println(F("[CONFIG] Configuration loaded."));
+}
+
+
+// -----------------------------------------------------------------------------
+// Network Identity
+// -----------------------------------------------------------------------------
+void setupHostname() {
+#if defined(ESP8266)
+  WiFi.hostname(deviceHostname);
+#elif defined(ESP32)
+  WiFi.setHostname(deviceHostname.c_str());
+#endif
 }
 
 
 // -----------------------------------------------------------------------------
 // WiFi Setup
 // -----------------------------------------------------------------------------
-const char *DEFAULT_AP_PASSWORD = "12345678";
-const char *AP_SSID = "ESPTimeCast";
-
 void connectWiFi() {
   Serial.println(F("[WIFI] Connecting to WiFi..."));
 
-  bool credentialsExist = (strlen(ssid) > 0);
-
-  if (!credentialsExist) {
+  if (!credentialsExist()) {
     Serial.println(F("[WIFI] No saved credentials. Starting AP mode directly."));
     WiFi.mode(WIFI_AP);
     WiFi.disconnect(true);
     delay(100);
 
+    setupHostname();
+
     if (strlen(DEFAULT_AP_PASSWORD) < 8) {
-      WiFi.softAP(AP_SSID);
+      WiFi.softAP(DEFAULT_AP_SSID);
       Serial.println(F("[WIFI] AP Mode started (no password, too short)."));
     } else {
-      WiFi.softAP(AP_SSID, DEFAULT_AP_PASSWORD);
+      WiFi.softAP(DEFAULT_AP_SSID, DEFAULT_AP_PASSWORD);
       Serial.println(F("[WIFI] AP Mode started."));
     }
 
@@ -462,14 +592,24 @@ void connectWiFi() {
   }
 
   // If credentials exist, attempt STA connection
+  WiFi.persistent(true);
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true);
-  delay(100);
-
+  WiFi.setAutoReconnect(true);
+#ifdef ESP8266
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+#endif
+#ifdef ESP32
+  WiFi.setSleep(false);
+#endif
+  setupHostname();
+  WiFi.disconnect();  // Ensure a clean slate
+  delay(100);         // The "Radio Breathing Room"
   WiFi.begin(ssid, password);
   unsigned long startAttemptTime = millis();
 
   const unsigned long timeout = 30000;
+  const int maxRetries = 3;
+  int retryCount = 0;
   unsigned long animTimer = 0;
   int animFrame = 0;
   bool animating = true;
@@ -488,19 +628,26 @@ void connectWiFi() {
                                                                    : "UNKNOWN");
 
       // --- IP Display initiation ---
-      pendingIpToShow = WiFi.localIP().toString();
-
-      // Replace all dots with your custom font code 184
-      for (int i = 0; i < pendingIpToShow.length(); i++) {
-        if (pendingIpToShow[i] == '.') {
-          pendingIpToShow[i] = 184;
+      if (LittleFS.exists("/update_success.txt")) {
+        // Use (char) to force the raw font glyphs and avoid the newline bug
+        pendingIpToShow = String((char)10) + (char)11 + (char)32 + (char)173 + String(FIRMWARE_VERSION);
+        LittleFS.remove("/update_success.txt");
+        IP_SCROLL_SPEED = 70;
+      } else {
+        pendingIpToShow = WiFi.localIP().toString();
+        IP_SCROLL_SPEED = 115;
+        // Replace all dots with your custom font code 184
+        for (int i = 0; i < pendingIpToShow.length(); i++) {
+          if (pendingIpToShow[i] == '.') {
+            pendingIpToShow[i] = 184;
+          }
         }
       }
 
       showingIp = true;
-      ipDisplayCount = 0;  // Reset count for IP display
+      ipDisplayCount = 0;
       P.displayClear();
-      P.setCharSpacing(1);  // Set spacing for IP scroll
+      P.setCharSpacing(1);
       textEffect_t actualScrollDirection = getEffectiveScrollDirection(PA_SCROLL_LEFT, flipDisplay);
       P.displayScroll(pendingIpToShow.c_str(), PA_CENTER, actualScrollDirection, IP_SCROLL_SPEED);
       // --- END IP Display initiation ---
@@ -508,32 +655,44 @@ void connectWiFi() {
       animating = false;  // Exit the connection loop
       break;
     } else if (now - startAttemptTime >= timeout) {
-      Serial.println(F("[WIFI] Failed. Starting AP mode..."));
-      WiFi.mode(WIFI_AP);
-      WiFi.softAP(AP_SSID, DEFAULT_AP_PASSWORD);
-      Serial.print(F("[WIFI] AP IP address: "));
-      Serial.println(WiFi.softAPIP());
-      dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
-      isAPMode = true;
 
-      auto mode = WiFi.getMode();
-      Serial.printf("[WIFI] WiFi mode after STA failure and setting AP: %s\n",
-                    mode == WIFI_OFF ? "OFF" : mode == WIFI_STA    ? "STA ONLY"
-                                             : mode == WIFI_AP     ? "AP ONLY"
-                                             : mode == WIFI_AP_STA ? "AP + STA (Error!)"
-                                                                   : "UNKNOWN");
+      if (retryCount < maxRetries - 1) {
+        retryCount++;
+        Serial.printf("[WIFI] Attempt failed. Retrying (%d/%d)...\n", retryCount + 1, maxRetries);
 
-      animating = false;
-      Serial.println(F("[WIFI] AP Mode Started"));
-      break;
+        WiFi.disconnect();
+        delay(500);
+        WiFi.begin(ssid, password);
+        startAttemptTime = millis();  // reset timeout timer
+      } else {
+        Serial.println(F("[WIFI] All attempts failed. Starting AP mode..."));
+
+        WiFi.mode(WIFI_AP);
+        WiFi.softAP(DEFAULT_AP_SSID, DEFAULT_AP_PASSWORD);
+        Serial.print(F("[WIFI] AP IP address: "));
+        Serial.println(WiFi.softAPIP());
+        dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+        isAPMode = true;
+
+        WiFiMode_t mode = WiFi.getMode();
+        Serial.printf("[WIFI] WiFi mode after STA failure and setting AP: %s\n",
+                      mode == WIFI_OFF ? "OFF" : mode == WIFI_STA    ? "STA ONLY"
+                                               : mode == WIFI_AP     ? "AP ONLY"
+                                               : mode == WIFI_AP_STA ? "AP + STA (Error!)"
+                                                                     : "UNKNOWN");
+
+        animating = false;
+        Serial.println(F("[WIFI] AP Mode Started"));
+        break;
+      }
     }
     if (now - animTimer > 750) {
       animTimer = now;
       P.setTextAlignment(PA_CENTER);
       switch (animFrame % 3) {
-        case 0: P.print(F("# ©")); break;
-        case 1: P.print(F("# ª")); break;
-        case 2: P.print(F("# «")); break;
+        case 0: P.print(F("\003 ©")); break;
+        case 1: P.print(F("\003 ª")); break;
+        case 2: P.print(F("\003 «")); break;
       }
       animFrame++;
     }
@@ -545,14 +704,13 @@ void connectWiFi() {
 // mDNS
 // -----------------------------------------------------------------------------
 void setupMDNS() {
-  const char *hostName = "esptimecast";  // your device name
   MDNS.end();
-  bool mdnsStarted = false;
-  mdnsStarted = MDNS.begin(hostName);
+
+  bool mdnsStarted = MDNS.begin(deviceHostname.c_str());
 
   if (mdnsStarted) {
     MDNS.addService("http", "tcp", 80);
-    Serial.printf("[WIFI] mDNS started: http://%s.local\n", hostName);
+    Serial.printf("[WIFI] mDNS started: http://%s.local\n", deviceHostname.c_str());
   } else {
     Serial.println("[WIFI] mDNS failed to start");
   }
@@ -635,6 +793,8 @@ void printConfigToSerial() {
   Serial.println(autoDimmingEnabled ? "Enabled" : "Disabled");
   Serial.print(F("Custom Dimming: "));
   Serial.println(dimmingEnabled ? "Enabled" : "Disabled");
+  Serial.print(F("Clock only during dimming: "));
+  Serial.println(clockOnlyDuringDimming ? "Yes" : "No");
 
   if (autoDimmingEnabled) {
     // --- Automatic (Sunrise/Sunset) dimming mode ---
@@ -688,6 +848,174 @@ void printConfigToSerial() {
   Serial.println();
 }
 
+void replaceIconTokens(String &msg, int &totalPixelWidth) {
+  struct IconMap {
+    const char *token;
+    const char *glyph;
+    int pixelWidth;
+  };
+
+  static const IconMap icons[] = {
+    { "[NOTEMP]", "\x01", 25 },
+    { "[NONTP]", "\x02", 20 },
+    { "[WIFI]", "\x03", 13 },
+    { "[INFO]", "\x04", 22 },
+    { "[AP]", "\x05", 9 },
+    { "[C]", "\x06", 4 },
+    { "[F]", "\x07", 4 },
+    { "[TIMEISUP]", "\x08", 32 },
+    { "[TIMEISUPINVERTED]", "\x09", 32 },
+    { "[SUNNY]", "\x0C", 8 },
+    { "[CLOUDY]", "\x0D", 8 },
+    { "[NODATA]", "\x0F", 23 },
+    { "[RAINY]", "\x10", 8 },
+    { "[THUNDER]", "\x11", 8 },
+    { "[SNOWY]", "\x12", 8 },
+    { "[WINDY]", "\x13", 8 },
+    { "[CLOCK]", "\x14", 8 },
+    { "[ALARM]", "\x15", 9 },
+    { "[UPDATE]", "\x16", 8 },
+    { "[BATTERYEMPTY]", "\x17", 8 },
+    { "[BATTERY33]", "\x18", 8 },
+    { "[BATTERY66]", "\x19", 8 },
+    { "[BATTERYFULL]", "\x1A", 8 },
+    { "[BOLT]", "\x1B", 4 },
+    { "[HOUSE]", "\x1C", 7 },
+    { "[TEMP]", "\x1D", 8 },
+    { "[MUSICNOTE]", "\x1E", 7 },
+    { "[PLAY]", "\x1F", 4 },
+    { "[SPACE]", "\x20", 1 },
+    { "[PAUSE]", "\x7F", 5 },
+    { "[EURO]", "\x80", 5 },
+    { "[SPEAKER]", "\x81", 8 },
+    { "[SPEAKEROFF]", "\x82", 8 },
+    { "[RED]", "\x83", 6 },
+    { "[UP]", "\x86", 3 },
+    { "[DOWN]", "\x88", 3 },
+    { "[RIGHT]", "\x8B", 8 },
+    { "[LEFT]", "\x8D", 8 },
+    { "[TALK]", "\x8E", 7 },
+    { "[HEART]", "\x8F", 7 },
+    { "[CHECK]", "\x90", 5 },
+    { "[INSTA]", "\x9B", 8 },
+    { "[TV]", "\x9C", 11 },
+    { "[YOUTUBE]", "\x9D", 8 },
+    { "[BELL]", "\x9E", 6 },
+    { "[LOCK]", "\x9F", 7 },
+    { "[PERSON]", "\xA0", 6 },
+    { "[HOURGLASS]", "\xA1", 5 },
+    { "[HOURGLASS25]", "\xA2", 5 },
+    { "[HOURGLASS75]", "\xA3", 5 },
+    { "[HOURGLASSFULL]", "\xA4", 5 },
+    { "[CAR]", "\xBB", 9 },
+    { "[MAIL]", "\xA6", 9 },
+    { "[CO2]", "\xA7", 13 },
+    { "[MOON]", "\xA8", 9 },
+    { "[SIGNAL1]", "\xA9", 8 },
+    { "[SIGNAL2]", "\xAA", 8 },
+    { "[SIGNAL3]", "\xAB", 8 },
+    { "[DEG]", "\xB0", 3 },
+    { "[SUNDAYJP]", "\xB1", 5 },
+    { "[MONDAYJP]", "\xB2", 6 },
+    { "[TUESDAYJP]", "\xB3", 7 },
+    { "[WEDNESDAYJP]", "\xB4", 7 },
+    { "[THURSDAYJP]", "\xB5", 7 },
+    { "[FRIDAYJP]", "\xB6", 7 },
+    { "[SATURDAYJP]", "\xB7", 7 },
+    { "[MIST]", "\xB9", 7 }
+  };
+
+  // 1. Replace all tokens with glyphs first
+  for (const auto &icon : icons) {
+    msg.replace(icon.token, icon.glyph);
+  }
+
+  // 2. Calculate pixel width of the resulting string
+  totalPixelWidth = 0;
+
+  for (int i = 0; i < (int)msg.length(); i++) {
+    bool isIcon = false;
+    int charWidth = 0;
+    unsigned char c = (unsigned char)msg[i];
+
+    // Check for icons
+    for (const auto &icon : icons) {
+      if (c == (unsigned char)icon.glyph[0]) {
+        charWidth = icon.pixelWidth;
+        isIcon = true;
+        break;
+      }
+    }
+
+    if (!isIcon) {
+      switch (c) {
+        // --- 1 Pixel Wide ---
+        case 32:  // Space
+        case '!':
+        case '.':
+        case ':':
+        case '\'':  // Single quote
+        case '|':
+        case 73:   // Capital 'I'
+        case 184:  // Custom Dot (IP display)
+          charWidth = 1;
+          break;
+
+        // --- 2 Pixels Wide ---
+        case 40:  // (
+        case 41:  // )
+        case 59:  // ;
+        case 91:  // [
+        case 93:  // ]
+        case ',':
+          charWidth = 2;
+          break;
+
+        // --- 3 Pixels Wide ---
+        case 34:
+        case '?':
+        case '-':
+        case '_':  // Underscore
+        case '/':
+          charWidth = 3;
+          break;
+
+        // --- 4 Pixels Wide ---
+        case 176:  // Degree symbol (Standard °)
+          charWidth = 4;
+          break;
+
+        // --- 5 Pixels Wide ---
+        case '#':
+        case '&':
+        case '$':
+        case 0xA5:  //¥
+        case '@':
+        case '+':  // Moved here: 5px
+          charWidth = 5;
+          break;
+
+        // --- 6 Pixels Wide ---
+        case '%':
+        case '~':
+          charWidth = 6;
+          break;
+
+        // --- Default (Caps & Numbers) ---
+        default:
+          charWidth = 3;
+          break;
+      }
+    }
+
+    totalPixelWidth += charWidth;
+
+    // Add 1px gap between characters/icons (except the last one)
+    if (i < (int)msg.length() - 1) {
+      totalPixelWidth += 1;
+    }
+  }
+}
 
 // -----------------------------------------------------------------------------
 // Web Server and Captive Portal
@@ -699,14 +1027,13 @@ void setupWebServer() {
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     Serial.println(F("[WEBSERVER] Request: /"));
-    request->send(LittleFS, "/index.html", "text/html");
+    AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html", index_html);
+    response->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    response->addHeader("Pragma", "no-cache");
+    response->addHeader("Expires", "0");
+    request->send(response);
   });
 
-  server.on("/generate_204", HTTP_GET, handleCaptivePortal);         // Android
-  server.on("/fwlink", HTTP_GET, handleCaptivePortal);               // Windows
-  server.on("/hotspot-detect.html", HTTP_GET, handleCaptivePortal);  // iOS/macOS
-  server.on("/ncsi.txt", HTTP_GET, handleCaptivePortal);             // Windows NCSI (variation)
-  server.on("/cp/success.txt", HTTP_GET, handleCaptivePortal);       // Android/Generic Success Check
   server.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(204);  // 204 No Content response
   });
@@ -807,8 +1134,10 @@ void setupWebServer() {
       else if (n == "subwayEnabled") doc[n] = (v == "true" || v == "on" || v == "1");
       else if (n == "timeOffsetMinutes") doc[n] = v.toInt();
       else if (n == "dimmingEnabled") doc[n] = (v == "true" || v == "on" || v == "1");
-      else if (n == "weatherUnits") doc[n] = v;
-
+      else if (n == "clockOnlyDuringDimming") {
+        doc[n] = (v == "true" || v == "on" || v == "1");
+      } else if (n == "weatherUnits") doc[n] = v;
+      else if (n == "hostname") doc[n] = v;
       else if (n == "password") {
         if (v != "********" && v.length() > 0) {
           doc[n] = v;  // user entered a new password
@@ -816,9 +1145,13 @@ void setupWebServer() {
           Serial.println(F("[SAVE] Password unchanged."));
           // do nothing, keep the one already in doc
         }
-      }
-
-      else if (n == "openWeatherApiKey") {
+      } else if (n == "ssid") {
+        if (v != "********" && v.length() > 0) {
+          doc[n] = v;
+        } else {
+          Serial.println(F("[SAVE] SSID unchanged."));
+        }
+      } else if (n == "openWeatherApiKey") {
         if (v != "********************************") {  // ignore mask only
           doc[n] = v;                                   // save new key (even if empty)
           Serial.print(F("[SAVE] API key updated: "));
@@ -926,6 +1259,9 @@ void setupWebServer() {
 
     Serial.println(F("[SAVE] Config verification successful."));
     DynamicJsonDocument okDoc(128);
+    if (doc.containsKey("hostname")) {
+      deviceHostname = doc["hostname"].as<String>();
+    }
     strlcpy(customMessage, doc["customMessage"] | "", sizeof(customMessage));
     okDoc[F("message")] = "Saved successfully. Rebooting...";
     String response;
@@ -1011,46 +1347,45 @@ void setupWebServer() {
 
     String sourceHeader = request->header("X-Source");
     bool isFromUI = (sourceHeader == "UI");
-    bool isFromHA = !isFromUI;
-
     int newBrightness = request->getParam("value", true)->value().toInt();
 
-    // Handle OFF request
+    // --- CASE 1: Turn Display OFF ---
     if (newBrightness == -1) {
-      P.displayShutdown(true);
-      P.displayClear();
-      displayOff = true;
+      if (!displayOff) {
+        P.displayShutdown(true);
+        P.displayClear();
+        displayOff = true;
+        brightness = -1;
+        configDirty = true;
+        lastBrightnessChange = millis();
 
-      Serial.printf("[BRIGHTNESS] Display OFF via %s\n",
-                    isFromUI ? "UI" : "HA");
-
+        Serial.printf("[BRIGHTNESS] Display turned OFF via %s\n", isFromUI ? "UI" : "HA");
+      }
       request->send(200, "application/json", "{\"ok\":true, \"display\":\"off\"}");
       return;
     }
 
-    // Clamp brightness range (0–15)
+    // --- CASE 2: Turn Display ON or Adjust ---
     newBrightness = constrain(newBrightness, 0, 15);
 
-    if (displayOff) {
-      // Wake from OFF
-      P.setIntensity(newBrightness);
-      advanceDisplayModeSafe();
-      P.displayShutdown(false);
+    if (newBrightness != brightness || displayOff) {
+      bool wakingUp = displayOff;
       brightness = newBrightness;
-      displayOff = false;
+      configDirty = true;
+      lastBrightnessChange = millis();
 
-      Serial.printf("[BRIGHTNESS] Display woke from OFF via %s → %d\n",
-                    isFromUI ? "UI" : "HA",
-                    newBrightness);
-    } else {
-      // Display already ON
-      brightness = newBrightness;
       P.setIntensity(brightness);
 
-      Serial.printf("[BRIGHTNESS] Set to %d via %s\n",
-                    brightness,
-                    isFromUI ? "UI" : "HA");
+      if (wakingUp) {
+        advanceDisplayModeSafe();
+        P.displayShutdown(false);
+        displayOff = false;
+        Serial.printf("[BRIGHTNESS] Display woke from OFF via %s to %d\n", isFromUI ? "UI" : "HA", brightness);
+      } else {
+        Serial.printf("[BRIGHTNESS] Intensity set to %d via %s\n", brightness, isFromUI ? "UI" : "HA");
+      }
     }
+
     request->send(200, "application/json", "{\"ok\":true}");
   });
 
@@ -1183,7 +1518,7 @@ void setupWebServer() {
 
       if (subwayEnabled == true && enabled == false) {
         Serial.println(F("[WEBSERVER] subwayEnabled toggled OFF. Checking display mode..."));
-        if (displayMode == 7) {
+        if (displayMode == 8) {
           Serial.println(F("[WEBSERVER] Currently in Subway mode. Forcing mode advance/cleanup."));
           advanceDisplayMode();
         }
@@ -1213,10 +1548,10 @@ void setupWebServer() {
       String v = request->getParam("value", true)->value();
       if (v == "1" || v == "true" || v == "on") {
         strcpy(weatherUnits, "imperial");
-        tempSymbol = ']';
+        tempSymbol = '\007';
       } else {
         strcpy(weatherUnits, "metric");
-        tempSymbol = '[';
+        tempSymbol = '\006';
       }
       Serial.printf("[WEBSERVER] Set weatherUnits to %s\n", weatherUnits);
       shouldFetchWeatherNow = true;
@@ -1277,15 +1612,146 @@ void setupWebServer() {
     request->send(200, "application/json", "{\"ok\":true}");
   });
 
+  // Set Clock-only-during-dimming (no reboot)
+  server.on("/set_clock_only_dimming", HTTP_POST, [](AsyncWebServerRequest *request) {
+    bool enableNow = false;
+    if (request->hasParam("value", true)) {
+      String v = request->getParam("value", true)->value();
+      enableNow = (v == "1" || v == "true" || v == "on");
+    }
+
+    // Update runtime variable immediately
+    clockOnlyDuringDimming = enableNow;
+    Serial.printf("[WEBSERVER] Set clockOnlyDuringDimming to %d (requested)\n", clockOnlyDuringDimming);
+
+    // Read existing config.json (if present)
+    DynamicJsonDocument doc(2048);
+    bool needToWrite = true;
+    File configFile = LittleFS.open("/config.json", "r");
+    if (configFile) {
+      DeserializationError err = deserializeJson(doc, configFile);
+      configFile.close();
+      if (err) {
+        Serial.print(F("[WEBSERVER] Error parsing existing config.json: "));
+        Serial.println(err.f_str());
+        // proceed to write (will create a new doc)
+        doc.clear();
+      } else {
+        // If the key exists and matches the requested value, skip write
+        bool existing = doc["clockOnlyDuringDimming"] | false;
+        if (existing == enableNow) {
+          Serial.println(F("[WEBSERVER] clockOnlyDuringDimming unchanged — skipping write."));
+          // Send immediate OK response without touching FS
+          DynamicJsonDocument okDoc(128);
+          okDoc[F("ok")] = true;
+          okDoc[F("clockOnlyDuringDimming")] = enableNow;
+          String response;
+          serializeJson(okDoc, response);
+          request->send(200, "application/json", response);
+          return;
+        }
+      }
+    } else {
+      // No config file found — doc is empty and we will write
+      doc.clear();
+    }
+
+    // Set/update the key in the JSON doc
+    doc[F("clockOnlyDuringDimming")] = clockOnlyDuringDimming;
+
+    // Backup existing file only if it exists (and only because we're about to replace it)
+    if (LittleFS.exists("/config.json")) {
+      if (!LittleFS.rename("/config.json", "/config.bak")) {
+        Serial.println(F("[WEBSERVER] Warning: failed to create config backup"));
+        // continue anyway
+      }
+    }
+
+    File f = LittleFS.open("/config.json", "w");
+    if (!f) {
+      Serial.println(F("[WEBSERVER] ERROR: Failed to open /config.json for writing"));
+      DynamicJsonDocument errDoc(128);
+      errDoc[F("error")] = "Failed to write config file.";
+      String response;
+      serializeJson(errDoc, response);
+      request->send(500, "application/json", response);
+      return;
+    }
+
+    size_t bytesWritten = serializeJson(doc, f);
+    f.close();
+    Serial.printf("[WEBSERVER] Saved clockOnlyDuringDimming=%d to /config.json (%u bytes written)\n", clockOnlyDuringDimming, bytesWritten);
+
+    // Send immediate response (no reboot)
+    DynamicJsonDocument okDoc(128);
+    okDoc[F("ok")] = true;
+    okDoc[F("clockOnlyDuringDimming")] = clockOnlyDuringDimming;
+    String response;
+    serializeJson(okDoc, response);
+    request->send(200, "application/json", response);
+  });
+
   // --- Custom Message Endpoint ---
   server.on("/set_custom_message", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (isNetworkBusy) {
+      request->send(503);
+      return;
+    }
     if (request->hasParam("message", true)) {
       String msg = request->getParam("message", true)->value();
       msg.trim();
 
+      // Identify type of request
+      bool isClearRequest = (msg.length() == 0);
+
+      // GET PARAMS FIRST (Important for logic checks below)
+      bool incomingAllowInterrupt = true;
+
+      // CLOCK-ONLY DIMMING PROTECTION
+      if (!isClearRequest && clockOnlyDuringDimming && dimActive) {
+        Serial.printf("[MESSAGE] Rejected due to clock-only dimming mode: '%s'\n", msg.c_str());
+        request->send(409, "text/plain", "Clock-only dimming mode active");
+        return;
+      }
+
+      // Handle Timer Commands first
+      if (handleTimerCommand(msg)) {
+        request->send(200, "text/plain", "Timer Command Executed");
+        return;
+      }
+
+      if (request->hasParam("allowInterrupt", true)) {
+        incomingAllowInterrupt = (request->getParam("allowInterrupt", true)->value() == "1");
+      }
+
+      // TIMER PROTECTION
+      // Reject if timer is active, it's not a clear request, AND incoming message is "interruptible" (standard)
+      if (timerActive && !isClearRequest && incomingAllowInterrupt) {
+        Serial.println(F("[TIMER] Message rejected: Timer is active and message is not priority."));
+        request->send(409, "text/plain", "Timer active - use priority message to interrupt");
+        return;
+      }
+
+      // PROTECTED MESSAGE RUNNING (Existing logic)
+      if (!isClearRequest && !allowInterrupt && incomingAllowInterrupt) {
+        Serial.printf("[MESSAGE] Rejected: protected message running (allowInterrupt=%d)\n", allowInterrupt);
+        request->send(409, "text/plain", "Display busy - protected message");
+        return;
+      }
+
+      // --- 1. CLEAN & NORMALIZE (The Master Cleaner) ---
+      // This handles Serbian, Spanish, Uppercase, and strips Japanese Kanji/etc.
+      // Call your renamed function here:
+      String filtered = cleanTextForDisplay(msg);
+
       String sourceHeader = request->header("X-Source");
       bool isFromUI = (sourceHeader == "UI");
       bool isFromHA = !isFromUI;
+
+      messageBigNumbers = false;
+      if (request->hasParam("bignumbers", true)) {
+        messageBigNumbers = (request->getParam("bignumbers", true)->value() == "1");
+      }
 
       messageDisplaySeconds = 0;  // Reset
       if (request->hasParam("seconds", true)) {
@@ -1303,18 +1769,34 @@ void setupWebServer() {
         localSpeed = constrain(request->getParam("speed", true)->value().toInt(), 10, 200);
       }
 
+      // Update displayMode immediately based on current state
+      if (timerActive) {
+        if (messageScrollTimes == 0 && messageDisplaySeconds == 0) {
+          // It's an infinite message: Abandon Mode 7, go to Message Mode
+          displayMode = 6;
+        } else {
+          // It's a timed message: Ensure we are in Mode 7 (Rotation handles the rest)
+          displayMode = 7;
+        }
+        lastSwitch = millis();
+        forceMessageRestart = true;
+      }
 
       // --- CLEAR MESSAGE ---
       if (msg.length() == 0) {
+        allowInterrupt = true;
+        forceMessageRestart = true;
         if (isFromUI) {
           // Web UI clear: The "real" clear, resets everything.
           customMessage[0] = '\0';
           lastPersistentMessage[0] = '\0';
-          displayMode = 0;
           messageStartTime = 0;
           currentScrollCount = 0;
           messageDisplaySeconds = 0;
           messageScrollTimes = 0;
+          displayMode = 0;
+          prevDisplayMode = 6;
+          clockScrollDone = false;
           Serial.println(F("[MESSAGE] All messages cleared by UI. Returning to normal mode."));
           request->send(200, "text/plain", "CLEARED (UI)");
 
@@ -1332,19 +1814,18 @@ void setupWebServer() {
 
           if (strlen(lastPersistentMessage) > 0) {
             // Restore the last persistent message
-            strncpy(customMessage, lastPersistentMessage, sizeof(customMessage));
+            strlcpy(customMessage, lastPersistentMessage, sizeof(customMessage));
             messageScrollSpeed = GENERAL_SCROLL_SPEED;  // Use global speed for persistent
-
             // Ensure displayMode is set to 6 so the restored persistent message is shown immediately.
             displayMode = 6;
             prevDisplayMode = 0;
-
             Serial.printf("[MESSAGE] Temporary HA message cleared. Restored persistent message: '%s' (speed=%d)\n",
                           customMessage, messageScrollSpeed);
             request->send(200, "text/plain", "CLEARED (HA temporary, persistent restored)");
           } else {
-            // No persistent message to restore, return to clock mode.
             displayMode = 0;
+            prevDisplayMode = 6;  // This tells the clock it's coming from a message
+            clockScrollDone = false;
             Serial.println(F("[MESSAGE] Temporary HA message cleared. No persistent message to restore."));
             request->send(200, "text/plain", "CLEARED (HA temporary, no persistent)");
           }
@@ -1369,43 +1850,48 @@ void setupWebServer() {
 
       filtered.toCharArray(customMessage, sizeof(customMessage));
 
+      Serial.printf(
+        "[MESSAGE] Source=%s | msg='%s' | seconds=%d | scrolls=%d | speed=%d | big=%d | allowInterrupt=%d\n",
+        isFromHA ? "HA" : "UI",
+        filtered.c_str(),
+        messageDisplaySeconds,
+        messageScrollTimes,
+        localSpeed,
+        messageBigNumbers,
+        incomingAllowInterrupt);
+
       // --- STORE MESSAGE ---
       if (isFromHA) {
         // --- Only backup if lastPersistentMessage exists ---
         if (strlen(lastPersistentMessage) > 0) {
-          Serial.printf("[HA] Will preserve persistent message: '%s'\n", lastPersistentMessage);
-        } else {
-          Serial.println(F("[HA] No persistent message to preserve. HA message is temporary only."));
+          // No log here to save memory
         }
 
         // --- Overwrite customMessage with new temporary HA message ---
         filtered.toCharArray(customMessage, sizeof(customMessage));
         messageScrollSpeed = localSpeed;
 
-        Serial.printf("[HA] Temporary HA message received: '%s' (persistent: '%s', duration: %ds, scrolls: %d, speed: %d)\n",
-                      customMessage,
-                      strlen(lastPersistentMessage) ? lastPersistentMessage : "(none)",
-                      messageDisplaySeconds,  // Added seconds
-                      messageScrollTimes,     // Added scrolltimes
-                      localSpeed);            // Added speed
       } else {
         // --- UI-originated message: permanent ---
         filtered.toCharArray(customMessage, sizeof(customMessage));
         strlcpy(lastPersistentMessage, customMessage, sizeof(lastPersistentMessage));
         messageScrollSpeed = GENERAL_SCROLL_SPEED;  // Always global for UI
 
-        Serial.printf("[UI] Persistent message stored: %s (speed=%d)\n",
-                      customMessage, messageScrollSpeed);
-
-        // --- Persist to config.json immediately ---
-        saveCustomMessageToConfig(customMessage);
+        // --- Save immediately for Web UI messages ---
+        saveCustomMessageToConfig(lastPersistentMessage);
+        Serial.printf("[CONFIG] UI message saved: '%s'\n", lastPersistentMessage);
       }
 
       // --- Activate display ---
+      allowInterrupt = incomingAllowInterrupt;
       displayMode = 6;
       prevDisplayMode = 0;
       messageStartTime = millis();  // Start the timer
       currentScrollCount = 0;
+
+      // NEW: Set the restart flag so the main loop can interrupt instantly
+      clockScrollDone = false;
+      forceMessageRestart = true;
 
       String response = String(isFromHA ? "OK (HA message, speed=" : "OK (UI message, speed=") + String(localSpeed);
       response += String(", duration=") + String(messageDisplaySeconds) + "s, scrolls=" + String(messageScrollTimes) + ")";
@@ -1416,24 +1902,250 @@ void setupWebServer() {
     }
   });
 
+  server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request) {
+    int scanStatus = WiFi.scanComplete();
+
+    // -2 means scan not triggered, -1 means scan in progress
+    if (scanStatus < -1 || scanStatus == WIFI_SCAN_FAILED) {
+      // Start the asynchronous scan
+      WiFi.scanNetworks(true);
+      request->send(202, "application/json", "{\"status\":\"processing\"}");
+    } else if (scanStatus == -1) {
+      // Scan is currently running
+      request->send(202, "application/json", "{\"status\":\"processing\"}");
+    } else {
+      // Scan finished (scanStatus >= 0)
+      String json = "[";
+      for (int i = 0; i < scanStatus; ++i) {
+        json += "{";
+        json += "\"ssid\":\"" + WiFi.SSID(i) + "\",";
+        json += "\"rssi\":" + String(WiFi.RSSI(i));
+        json += "}";
+        if (i < scanStatus - 1) json += ",";
+      }
+      json += "]";
+
+      // Clean up scan results from memory
+      WiFi.scanDelete();
+      request->send(200, "application/json", json);
+    }
+  });
+
+  server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request) {
+    int scanStatus = WiFi.scanComplete();
+
+    // -2 means scan not triggered, -1 means scan in progress
+    if (scanStatus < -1 || scanStatus == WIFI_SCAN_FAILED) {
+      // Start the asynchronous scan
+      WiFi.scanNetworks(true);
+      request->send(202, "application/json", "{\"status\":\"processing\"}");
+    } else if (scanStatus == -1) {
+      // Scan is currently running
+      request->send(202, "application/json", "{\"status\":\"processing\"}");
+    } else {
+      // Scan finished (scanStatus >= 0)
+      String json = "[";
+      for (int i = 0; i < scanStatus; ++i) {
+        json += "{";
+        json += "\"ssid\":\"" + WiFi.SSID(i) + "\",";
+        json += "\"rssi\":" + String(WiFi.RSSI(i));
+        json += "}";
+        if (i < scanStatus - 1) json += ",";
+      }
+      json += "]";
+
+      // Clean up scan results from memory
+      WiFi.scanDelete();
+      request->send(200, "application/json", json);
+    }
+  });
+
+  server.on("/ip", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String ip;
+
+    if (WiFi.getMode() == WIFI_AP) {
+      ip = WiFi.softAPIP().toString();  // usually 192.168.4.1
+    } else if (WiFi.isConnected()) {
+      ip = WiFi.localIP().toString();
+    } else {
+      ip = "—";
+    }
+
+    request->send(200, "text/plain", ip);
+  });
+
   server.on("/uptime", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!LittleFS.exists("/uptime.dat")) {
-      request->send(200, "text/plain", "No uptime recorded yet.");
-      return;
+    // 1. Get Total Lifetime (from LittleFS)
+    unsigned long totalSeconds = 0;
+    if (LittleFS.exists("/uptime.dat")) {
+      File f = LittleFS.open("/uptime.dat", "r");
+      if (f) {
+        totalSeconds = f.readString().toInt();
+        f.close();
+      }
     }
 
-    File f = LittleFS.open("/uptime.dat", "r");
-    if (!f) {
-      request->send(500, "text/plain", "Error reading uptime file.");
-      return;
+    // 2. Calculate Session Uptime (Time since boot)
+    unsigned long sessionSeconds = millis() / 1000;
+
+    // 3. Build the combined JSON
+    String json = "{";
+    json += "\"hostname\":\"" + deviceHostname + "\",";
+    json += "\"total_seconds\":" + String(totalSeconds) + ",";
+    json += "\"total_formatted\":\"" + formatUptime(totalSeconds) + "\",";
+    json += "\"session_seconds\":" + String(sessionSeconds) + ",";
+    json += "\"session_formatted\":\"" + formatUptime(sessionSeconds) + "\",";
+    json += "\"version\":\"" FIRMWARE_VERSION "\"";
+    json += "}";
+
+    request->send(200, "application/json", json);
+  });
+
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    DynamicJsonDocument doc(4096);
+
+    // --- Identity ---
+    doc["id"] = deviceHostname;
+    doc["version"] = FIRMWARE_VERSION;
+    doc["hardware"] = "MAX7219_FC16";
+#if defined(ESP32)
+    doc["board"] = "ESP32";
+#elif defined(ESP8266)
+      doc["board"] = "ESP8266";
+#else
+      doc["board"] = "unknown";
+#endif
+
+    // --- Display & Mode ---
+    doc["displayMode"] = displayMode;
+    doc["displayBusy"] = (displayMode == 6 || displayMode == 7 || displayMode == 8);
+    doc["allowInterrupt"] = allowInterrupt;
+
+    switch (displayMode) {
+      case 0: doc["mode"] = "clock"; break;
+      case 1: doc["mode"] = "weather"; break;
+      case 2: doc["mode"] = "weather_desc"; break;
+      case 3: doc["mode"] = "countdown"; break;
+      case 4: doc["mode"] = "nightscout"; break;
+      case 5: doc["mode"] = "date"; break;
+      case 6: doc["mode"] = "message"; break;
+      case 7: doc["mode"] = "timer"; break;
+      default: doc["mode"] = "cycling"; break;
     }
 
-    String content = f.readString();
-    f.close();
+    doc["message"] = (strlen(customMessage) > 0) ? customMessage : "";
+    doc["displayOff"] = displayOff;
+    doc["brightness"] = brightness;
 
-    unsigned long seconds = content.toInt();
-    String formatted = formatUptime(seconds);
-    request->send(200, "text/plain", formatted);
+    // --- Runtime ---
+    doc["device_runtime"] = formatTotalRuntime();
+    doc["session_runtime"] = millis() / 1000;
+    doc["wifi_signal"] = WiFi.RSSI();
+    doc["mdns_url"] = String(deviceHostname) + ".local";
+    doc["time_synced"] = ntpSyncSuccessful;
+
+    // --- Local Time & Epoch ---
+    time_t nowTime = time(nullptr);
+    struct tm timeinfo;
+    localtime_r(&nowTime, &timeinfo);
+    char buffer[20];
+    strftime(buffer, sizeof(buffer), "%H:%M:%S", &timeinfo);
+    doc["localTime"] = String(buffer);
+    doc["epochTime"] = static_cast<uint32_t>(nowTime);
+
+    // --- Countdown ---
+    JsonObject cd = doc.createNestedObject("countdown");
+    cd["enabled"] = countdownEnabled;
+    cd["targetTimestamp"] = countdownTargetTimestamp;
+    cd["label"] = String(countdownLabel);
+    cd["isDramatic"] = isDramaticCountdown;
+
+    long long remaining = static_cast<long long>(countdownTargetTimestamp) - static_cast<long long>(nowTime);
+    cd["remaining"] = countdownEnabled ? (remaining > 0 ? remaining : 0) : 0;
+
+    doc["countdownEnabled"] = countdownEnabled;
+    doc["countdownLabel"] = String(countdownLabel);
+
+    // --- Weather ---
+    JsonObject weather = doc.createNestedObject("weather");
+
+    if (weatherAvailable && weatherDescription.length() > 0) {
+      weather["currentTemperature"] = String(currentTemp).toInt();
+      weather["weatherDescription"] = weatherDescription;
+      weather["icon"] = weatherIcon;
+    } else {
+      weather["currentTemperature"] = JsonVariant();
+      weather["weatherDescription"] = JsonVariant();
+      weather["icon"] = JsonVariant();
+    }
+
+    weather["currentHumidity"] = (weatherAvailable && weatherDescription.length() > 0) ? currentHumidity : JsonVariant();
+    weather["sunriseHour"] = weatherAvailable ? sunriseHour : JsonVariant();
+    weather["sunriseMinute"] = weatherAvailable ? sunriseMinute : JsonVariant();
+    weather["sunsetHour"] = weatherAvailable ? sunsetHour : JsonVariant();
+    weather["sunsetMinute"] = weatherAvailable ? sunsetMinute : JsonVariant();
+
+    // --- Nightscout info ---
+#if defined(ESP32) || defined(ESP8266)
+    JsonObject ns = doc.createNestedObject("nightscout");
+    ns["active"] = (displayMode == 4);
+    if (currentGlucose != -1) ns["glucose"] = currentGlucose;
+    else ns["glucose"] = nullptr;
+    if (currentDirection.length() > 0 && currentDirection != "?") ns["trend"] = currentDirection;
+    else ns["trend"] = nullptr;
+
+    if (lastGlucoseTime > 0) {
+      ns["lastReadingEpoch"] = lastGlucoseTime;
+      time_t nowUTC = time(nullptr);
+      int minutes = static_cast<int>(difftime(nowUTC, lastGlucoseTime) / 60.0);
+      ns["minutesSinceReading"] = (minutes > 0) ? minutes : 0;
+      ns["isOutdated"] = (minutes > NIGHTSCOUT_IDLE_THRESHOLD_MIN);
+    } else {
+      ns["lastReadingEpoch"] = nullptr;
+      ns["minutesSinceReading"] = nullptr;
+      ns["isOutdated"] = true;
+    }
+#endif
+
+    // --- Saved Config ---
+    JsonObject config = doc.createNestedObject("config");
+    config["ssid"] = String(ssid);
+    config["openWeatherApiKey"] = (strlen(openWeatherApiKey) > 0) ? "***HIDDEN***" : "";
+    config["openWeatherCity"] = String(openWeatherCity);
+    config["weatherUnits"] = String(weatherUnits);
+    config["clockDuration"] = clockDuration;
+    config["weatherDuration"] = weatherDuration;
+    config["timeZone"] = String(timeZone);
+    config["language"] = String(language);
+    config["flipDisplay"] = flipDisplay;
+    config["twelveHourToggle"] = twelveHourToggle;
+    config["showDate"] = showDate;
+    config["showHumidity"] = showHumidity;
+    config["ntpServer1"] = String(ntpServer1);
+
+    String nsUrl = String(ntpServer2);
+    int tokenIdx = nsUrl.indexOf("token=");
+    if (tokenIdx == -1) tokenIdx = nsUrl.indexOf("api_key=");
+
+    if (tokenIdx != -1) {
+      int keyStart = nsUrl.indexOf('=', tokenIdx) + 1;
+      config["ntpServer2"] = nsUrl.substring(0, keyStart) + "***HIDDEN***";
+    } else {
+      config["ntpServer2"] = nsUrl;
+    }
+
+    // --- Dimming ---
+    JsonObject dimming = doc.createNestedObject("dimming");
+    dimming["dimmingEnabled"] = dimmingEnabled;
+    dimming["dimStartHour"] = dimStartHour;
+    dimming["dimStartMinute"] = dimStartMinute;
+    dimming["dimEndHour"] = dimEndHour;
+    dimming["dimEndMinute"] = dimEndMinute;
+    dimming["autoDimmingEnabled"] = autoDimmingEnabled;
+
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
   });
 
   server.on("/export", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -1481,44 +2193,54 @@ void setupWebServer() {
   server.on("/upload", HTTP_GET, [](AsyncWebServerRequest *request) {
     String html = R"rawliteral(
     <!DOCTYPE html>
-    <html style="background: radial-gradient(ellipse at 70% 0%, #2b425a 0%, #171e23 100%); height: 100%;">
+    <html>
       <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <style>
-          body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;
-            color: #FFFFFF;
-            transition: opacity 0.6s cubic-bezier(.4, 0, .2, 1);
-            line-height: 1.5;
-            max-width: 300px;
-            margin: 3rem auto;
-            background: linear-gradient(120deg, rgba(45, 65, 90, 0.72) 0%, rgba(53, 133, 183, 0.38) 100%);
-            padding: 1.5rem;
-            border-radius: 24px;
-            box-shadow: 0 10px 36px 0 rgba(40, 170, 255, 0.11), 0 2px 8px 0 rgba(44, 70, 110, 0.08);
-            border: 1.5px solid rgba(180, 230, 255, 0.10);
-            text-align: center;
-            }
-          
-          h3 {
-            margin-top: 0;
+         <style>
+            html{
+                background: linear-gradient(135deg, #081f56 0%, #110f2e 50%, #441a65 100%);
+                height: 100%;
             }
 
-          input::file-selector-button {
-            background: linear-gradient(90deg, #3e99bc, #47add4 85%);
-            color: white;
-            padding: 0.9rem;
-            font-size: 1rem;
-            font-weight: 600;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            text-align: center;
-            transition: background 0.25s, transform 0.15s 
-            ease-in-out;
+            body {
+                border: solid 1px rgba(255, 255, 255, 0.12);
+                transition: opacity 0.6s cubic-bezier(.4, 0, .2, 1);
+                max-width: 300px;
+                margin: 4rem auto;
+                background: rgba(255, 255, 255, 0.04);
+                border-radius: 24px;
+                text-align: center;
+                font-family: Roboto, system-ui;
+                /* margin: 0; */
+                padding: 2rem 1rem;
+                color: #ffffff;
+                background-repeat: no-repeat, repeat, repeat;
+                line-height: 1.5;
+                -webkit-font-smoothing: antialiased;
+                -moz-osx-font-smoothing: grayscale;
+                box-shadow: 0 10px 36px 0 rgba(40, 170, 255, 0.11), 0 2px 8px 0 rgba(44, 70, 110, 0.08);
+              }
+            
+            h3 {
+              margin-top: 0;
+              }
+
+            input::file-selector-button {
+              background: #0ea5e9;
+              color: white;
+              padding: 0.9rem 1.8rem;
+              font-size: 1rem;
+              font-weight: 600;
+              border: none;
+              border-radius: 999px;
+              cursor: pointer;
+              text-align: center;
+              transition: background 0.25s, transform 0.15s 
+              ease-in-out;
+              margin-right: 0.5rem;
             }
-        </style>
+          </style>
       </head>
       <body>
         <h3>Upload config.json</h3>
@@ -1535,26 +2257,35 @@ void setupWebServer() {
     "/upload", HTTP_POST, [](AsyncWebServerRequest *request) {
       String html = R"rawliteral(
       <!DOCTYPE html>
-      <html style="background: radial-gradient(ellipse at 70% 0%, #2b425a 0%, #171e23 100%); height: 100%;">
+      <html>
         <head>
           <meta charset="UTF-8" />
           <meta name="viewport" content="width=device-width, initial-scale=1" />
           <title>Upload Successful</title>
           <meta http-equiv="refresh" content="1; url=/" />
           <style>
+            html{
+                background: linear-gradient(135deg, #081f56 0%, #110f2e 50%, #441a65 100%);
+                height: 100%;
+            }
+
             body {
-              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;
-              color: #FFFFFF;
-              transition: opacity 0.6s cubic-bezier(.4, 0, .2, 1);
-              line-height: 1.5;
-              max-width: 300px;
-              margin: 3rem auto;
-              background: linear-gradient(120deg, rgba(45, 65, 90, 0.72) 0%, rgba(53, 133, 183, 0.38) 100%);
-              padding: 1.5rem;
-              border-radius: 24px;
-              box-shadow: 0 10px 36px 0 rgba(40, 170, 255, 0.11), 0 2px 8px 0 rgba(44, 70, 110, 0.08);
-              border: 1.5px solid rgba(180, 230, 255, 0.10);
-              text-align: center;
+                border: solid 1px rgba(255, 255, 255, 0.12);
+                transition: opacity 0.6s cubic-bezier(.4, 0, .2, 1);
+                max-width: 300px;
+                margin: 4rem auto;
+                background: rgba(255, 255, 255, 0.04);
+                border-radius: 24px;
+                text-align: center;
+                font-family: Roboto, system-ui;
+                /* margin: 0; */
+                padding: 2rem 1rem;
+                color: #ffffff;
+                background-repeat: no-repeat, repeat, repeat;
+                line-height: 1.5;
+                -webkit-font-smoothing: antialiased;
+                -moz-osx-font-smoothing: grayscale;
+                box-shadow: 0 10px 36px 0 rgba(40, 170, 255, 0.11), 0 2px 8px 0 rgba(44, 70, 110, 0.08);
               }
             
             h3 {
@@ -1562,18 +2293,19 @@ void setupWebServer() {
               }
 
             input::file-selector-button {
-              background: linear-gradient(90deg, #3e99bc, #47add4 85%);
+              background: #0ea5e9;
               color: white;
-              padding: 0.9rem;
+              padding: 0.9rem 1.8rem;
               font-size: 1rem;
               font-weight: 600;
               border: none;
-              border-radius: 8px;
+              border-radius: 999px;
               cursor: pointer;
               text-align: center;
               transition: background 0.25s, transform 0.15s 
               ease-in-out;
-              }
+              margin-right: 0.5rem;
+            }
           </style>
         </head>
         <body>
@@ -1598,6 +2330,72 @@ void setupWebServer() {
       if (final) f.close();       // finish file
     });
 
+  server.on("/get_version", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String json = "{";
+    json += "\"version\":\"" + String(FIRMWARE_VERSION) + "\",";
+    json += "\"board\":\"" + String(BOARD_TYPE) + "\"";
+    json += "}";
+    request->send(200, "application/json", json);
+  });
+
+  server.on("/perform_update", HTTP_GET, [](AsyncWebServerRequest *request) {
+    isUpdating = true;
+
+    // Immediate UI Feedback
+    P.displayClear();
+    P.print((char)172);  // Show your download/update icon
+
+    request->send(200, "application/json", "{\"status\":\"ready\"}");
+  });
+
+  server.on(
+    "/upload_ota", HTTP_POST, [](AsyncWebServerRequest *request) {
+      if (!Update.hasError()) {
+        request->send(200, "text/plain", "OK");
+        // Set flags to reboot in the main loop
+        pendingRestart = true;
+        restartTimer = millis();
+      } else {
+        request->send(200, "text/plain", "FAIL");
+      }
+    },
+    [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+      // This runs for every chunk of data received
+      if (!index) {
+        Serial.printf("[OTA] Start: %s\n", filename.c_str());
+
+#ifdef ESP8266
+        Update.runAsync(true);  // Critical: Prevent __yield panic on ESP8266
+#endif
+
+        // Calculate max available space for the firmware
+        uint32_t maxSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+        if (!Update.begin(maxSpace, U_FLASH)) {
+          Update.printError(Serial);
+        }
+      }
+
+      if (!Update.hasError()) {
+        if (Update.write(data, len) != len) {
+          Update.printError(Serial);
+        }
+      }
+
+      if (final) {
+        if (Update.end(true)) {
+          Serial.printf("[OTA] Finished: %u bytes\n", index + len);
+          // CREATE THE "SUCCESS" FLAG
+          File f = LittleFS.open("/update_success.txt", "w");
+          if (f) {
+            f.print("1");
+            f.close();
+          }
+        } else {
+          Update.printError(Serial);
+        }
+      }
+    });
+
   server.on("/factory_reset", HTTP_GET, [](AsyncWebServerRequest *request) {
     // If not in AP mode, block and return a 403 response
     if (!isAPMode) {
@@ -1607,25 +2405,36 @@ void setupWebServer() {
     }
     const char *FACTORY_RESET_HTML = R"rawliteral(
       <!DOCTYPE html>
-      <html style="background: radial-gradient(ellipse at 70% 0%, #2b425a 0%, #171e23 100%); height: 100%;">
+      <html>
         <head>
           <meta charset="UTF-8" />
           <meta name="viewport" content="width=device-width, initial-scale=1" />
           <title>Resetting Device</title>
           <style>
-            body {
-              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;
-              color: #FFFFFF;
-              line-height: 1.5;
-              max-width: 300px;
-              margin: 3rem auto;
-              background: linear-gradient(120deg, rgba(144, 45, 45, 0.72) 0%, rgba(183, 53, 53, 0.38) 100%);
-              padding: 1.5rem;
-              border-radius: 24px;
-              box-shadow: 0 10px 36px 0 rgba(255, 40, 40, 0.11), 0 2px 8px 0 rgba(110, 44, 44, 0.08);
-              border: 1.5px solid rgba(255, 180, 180, 0.10);
-              text-align: center;
+            html{
+                background: linear-gradient(135deg, #081f56 0%, #110f2e 50%, #441a65 100%);
+                height: 100%;
             }
+
+            body {
+                border: solid 1px rgba(255, 255, 255, 0.12);
+                transition: opacity 0.6s cubic-bezier(.4, 0, .2, 1);
+                max-width: 300px;
+                margin: 4rem auto;
+                background: rgba(255, 255, 255, 0.04);
+                border-radius: 24px;
+                text-align: center;
+                font-family: Roboto, system-ui;
+                /* margin: 0; */
+                padding: 2rem 1rem;
+                color: #ffffff;
+                background-repeat: no-repeat, repeat, repeat;
+                line-height: 1.5;
+                -webkit-font-smoothing: antialiased;
+                -moz-osx-font-smoothing: grayscale;
+                box-shadow: 0 10px 36px 0 rgba(40, 170, 255, 0.11), 0 2px 8px 0 rgba(44, 70, 110, 0.08);
+              }
+
             h3 { margin-top: 0; color: #ff9999; }
             p { font-size: 1.1em; }
             .warning { font-size: 1.2em; font-weight: bold; color: #fff; margin-top: 15px; }
@@ -1690,31 +2499,42 @@ void setupWebServer() {
   Serial.println(F("[WEBSERVER] Web server started"));
 }
 
-
 void handleCaptivePortal(AsyncWebServerRequest *request) {
   String uri = request->url();
 
-  // Filter out system-generated probe requests
-  if (!uri.endsWith("/204") && !uri.endsWith("/ipv6check") && !uri.endsWith("connecttest.txt") && !uri.endsWith("/generate_204") && !uri.endsWith("/fwlink") && !uri.endsWith("/hotspot-detect.html")) {
-
-    Serial.print(F("[WEBSERVER] Captive Portal triggered for URL: "));
-    Serial.println(uri);
+  // Never interfere with real UI or API
+  if (
+    uri == "/" || uri == "/index.html" || uri.startsWith("/config") || uri.startsWith("/hostname") || uri.startsWith("/ip") || uri.endsWith(".json") || uri.endsWith(".js") || uri.endsWith(".css") || uri.endsWith(".png") || uri.endsWith(".ico")) {
+    return;  // let normal handlers serve it
   }
 
+  // Known captive portal probes → redirect
+  if (
+    uri == "/generate_204" || uri == "/gen_204" || uri == "/fwlink" || uri == "/hotspot-detect.html" || uri == "/ncsi.txt" || uri == "/cp/success.txt" || uri == "/library/test/success.html") {
+    if (isAPMode) {
+      IPAddress apIP = WiFi.softAPIP();
+      String redirectUrl = "http://" + apIP.toString() + "/";
+      //Serial.printf("[WEBSERVER] Captive probe %s → redirect\n", uri.c_str());
+      request->redirect(redirectUrl);
+      return;
+    }
+  }
+
+  // Unknown URLs in AP mode → redirect (helps odd OSes like /chat)
   if (isAPMode) {
     IPAddress apIP = WiFi.softAPIP();
     String redirectUrl = "http://" + apIP.toString() + "/";
-    Serial.print(F("[WEBSERVER] Redirecting to captive portal: "));
-    Serial.println(redirectUrl);
+    Serial.printf("[WEBSERVER] Captive fallback redirect: %s\n", uri.c_str());
     request->redirect(redirectUrl);
-  } else {
-    Serial.println(F("[WEBSERVER] Not in AP mode — sending 404"));
-    request->send(404, "text/plain", "Not found");
+    return;
   }
+
+  // STA mode fallback
+  request->send(404, "text/plain", "Not found");
 }
 
 
-String normalizeWeatherDescription(String str) {
+String cleanTextForDisplay(String str) {
   // Serbian Cyrillic → Latin
   str.replace("а", "a");
   str.replace("б", "b");
@@ -1849,12 +2669,14 @@ String normalizeWeatherDescription(String str) {
 
   String result = "";
   for (unsigned int i = 0; i < str.length(); i++) {
-    char c = str.charAt(i);
-    if ((c >= 'A' && c <= 'Z') || c == ' ') {
-      result += c;
+    unsigned char c = (unsigned char)str.charAt(i);  // Use unsigned for safety
+
+    // MASTER FILTER: Expanded for Modern Smart Home Notifications
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || strchr(" !.?:,;'\"-_+%/[]()#&¥$ ;|°@^~*=<>\t\n\r\\{}", c)) {
+      result += (char)c;
     }
   }
-  return result;
+  return result;  // Return the cleaned string
 }
 
 String normalizeSubwayText(String str) {
@@ -2020,7 +2842,11 @@ bool isFiveDigitZip(const char *str) {
 // Weather Fetching and API settings
 // -----------------------------------------------------------------------------
 String buildWeatherURL() {
+#if defined(ESP8266) || defined(CONFIG_IDF_TARGET_ESP32S2)
+  String base = "http://api.openweathermap.org/data/2.5/weather?";
+#else
   String base = "https://api.openweathermap.org/data/2.5/weather?";
+#endif
 
   float lat = atof(openWeatherCity);
   float lon = atof(openWeatherCountry);
@@ -2084,13 +2910,26 @@ void fetchWeather() {
   Serial.print(F("[WEATHER] URL: "));  // Use F() with Serial.print
   Serial.println(url);
 
-  WiFiClientSecure client;  // use secure client for HTTPS
-  client.stop();            // ensure previous session closed
-  yield();                  // Allow OS to process socket closure
-  client.setInsecure();     // no cert validation
-  HTTPClient http;          // Create an HTTPClient object
-  http.begin(client, url);  // Pass the WiFiClient object and the URL
-  http.setTimeout(10000);   // Sets both connection and stream timeout to 10 seconds
+  HTTPClient http;  // Create an HTTPClient object
+
+#if defined(ESP8266) || defined(CONFIG_IDF_TARGET_ESP32S2)
+  // ===== ESP8266 → HTTP =====
+  WiFiClient client;
+  client.stop();
+  yield();
+
+  http.begin(client, url);
+#else
+  // ===== ESP32 → HTTPS =====
+  WiFiClientSecure client;
+  client.stop();
+  yield();
+  client.setInsecure();  // no cert validation
+
+  http.begin(client, url);
+#endif
+
+  http.setTimeout(10000);  // Sets both connection and stream timeout to 10 seconds
 
   Serial.println(F("[WEATHER] Sending GET request..."));
   int httpCode = http.GET();  // Send the GET request
@@ -2139,11 +2978,13 @@ void fetchWeather() {
       if (weatherObj.containsKey(F("description"))) {
         detailedDesc = weatherObj[F("description")].as<String>();
       }
+      if (weatherObj.containsKey(F("icon"))) {
+        weatherIcon = getWeatherIconChar(weatherObj[F("icon")].as<String>());
+      }
     } else {
       Serial.println(F("[WEATHER] Weather description not found in JSON payload"));
     }
-
-    weatherDescription = normalizeWeatherDescription(detailedDesc);
+    weatherDescription = String(weatherIcon) + " " + cleanTextForDisplay(detailedDesc);
     Serial.printf("[WEATHER] Description used: %s\n", weatherDescription.c_str());
 
     // -----------------------------------------
@@ -2357,6 +3198,113 @@ String formatUptime(unsigned long seconds) {
   return String(buf);
 }
 
+// Weather Icon Mapping
+char getWeatherIconChar(const String &iconCode) {
+
+  if (iconCode.startsWith("01")) {                    // clear sky
+    return iconCode.endsWith("n") ? '\xA8' : '\x0C';  // Moon : Sun
+  }
+
+  if (iconCode.startsWith("02")) return '\x0D';  // few clouds
+  if (iconCode.startsWith("03")) return '\x0D';  // scattered clouds
+  if (iconCode.startsWith("04")) return '\x0D';  // broken clouds
+
+  if (iconCode.startsWith("09")) return '\x10';  // shower rain
+  if (iconCode.startsWith("10")) return '\x10';  // rain
+
+  if (iconCode.startsWith("11")) return '\x11';  // thunderstorm
+  if (iconCode.startsWith("13")) return '\x12';  // snow
+  if (iconCode.startsWith("50")) return '\xB9';  // mist
+
+  return '\x0D';  // fallback = cloud
+}
+
+// Timer Helper
+bool handleTimerCommand(String cmd) {
+  cmd.toUpperCase();
+  if (cmd.indexOf("[TIMER") == -1) return false;
+
+  int start = cmd.indexOf("[TIMER") + 6;
+  int end = cmd.indexOf("]", start);
+  String payload = cmd.substring(start, end);
+  payload.trim();
+
+  if (payload == "STOP" || payload == "CANCEL") {
+    timerActive = false;
+    timerFinished = false;
+    timerPaused = false;
+    displayMode = 0;      // Force back to Clock
+    prevDisplayMode = 6;  // Ensure rotation logic knows where we came from
+    clockScrollDone = false;
+    forceMessageRestart = true;  // Clear out any stale Parola states
+    lastSwitch = millis();       // Reset the rotation timer so Clock stays for its full duration
+    Serial.println(F("[TIMER] Stopped. Returning to Clock."));
+    return true;
+  }
+
+  if (payload == "PAUSE") {
+    if (timerActive && !timerPaused && !timerFinished) {
+      timerPaused = true;
+      timerRemainingAtPause = timerEndTime - millis();
+    }
+    return true;
+  }
+
+  if (payload == "RESUME" || payload == "START") {
+    if (timerActive && timerPaused) {
+      timerEndTime = millis() + timerRemainingAtPause;
+      timerPaused = false;
+    }
+    return true;
+  }
+
+  if (payload == "RESTART") {
+    if (timerOriginalDuration > 0) {
+      timerEndTime = millis() + timerOriginalDuration;
+      timerActive = true;
+      timerPaused = false;
+      timerFinished = false;
+      displayMode = 7;
+      timerSubState = 0;
+      lastSwitch = millis();
+      forceMessageRestart = true;
+      return true;
+    }
+    return false;
+  }
+
+  long totalMs = 0;
+  String val = "";
+  for (unsigned int i = 0; i < payload.length(); i++) {
+    char c = payload.charAt(i);
+    if (isDigit(c)) val += c;
+    else {
+      long num = val.toInt();
+      if (c == 'H') totalMs += num * 3600000;
+      else if (c == 'M') totalMs += num * 60000;
+      else if (c == 'S') totalMs += num * 1000;
+      val = "";
+    }
+  }
+  if (val.length() > 0 && totalMs == 0) totalMs = val.toInt() * 60000;
+
+  if (totalMs > 86400000) totalMs = 86400000;  // 24h Cap
+
+  if (totalMs > 0) {
+    timerOriginalDuration = totalMs;
+    timerEndTime = millis() + totalMs;
+    timerActive = true;
+    timerPaused = false;
+    timerFinished = false;
+    timerSubState = 0;
+    displayMode = 7;
+    lastSwitch = millis();
+    forceMessageRestart = true;
+    return true;
+  }
+  return false;
+}
+
 
 // -----------------------------------------------------------------------------
 // Main setup() and loop()
@@ -2370,31 +3318,47 @@ DisplayMode key:
   4: Nightscout
   5: Date
   6: Custom Message
-  7: Subway (placeholder)
+  7: Timer
+  8: Subway
 */
 void setup() {
   Serial.begin(115200);
   delay(1000);
+  esp_log_level_set("esp_littlefs", ESP_LOG_NONE);
   Serial.println();
   Serial.println(F("[SETUP] Starting setup..."));
-
+#if defined(ARDUINO_USB_MODE) || defined(USB_SERIAL)
+  Serial.setTxTimeoutMs(50);
+  Serial.println(F("[SERIAL] USB CDC detected — TX timeout enabled"));
+  delay(500);
+#endif
+  Serial.println(F("[FS] Mounting LittleFS (auto-format enabled)..."));
   if (!LittleFS.begin(true)) {
-    Serial.println(F("[ERROR] LittleFS mount failed in setup! Halting."));
+    Serial.println(F("[ERROR] LittleFS mount failed even after format. Halting."));
     while (true) {
       delay(1000);
       yield();
     }
   }
-  Serial.println(F("[SETUP] LittleFS file system mounted successfully."));
+  Serial.println(F("[FS] LittleFS mounted and ready."));
   loadUptime();
-  ensureHtmlFileExists();
   P.begin();  // Initialize Parola library
 
   P.setCharSpacing(0);
-  P.setFont(mFactory);
+#ifdef USE_CUSTOM_FONT
+  P.setFont(mFactory);  // Using the variable name from your private header
+#else
+  P.setFont(newFont);  // Using the variable name from basic_font.h
+#endif
   loadConfig();  // This function now has internal yields and prints
 
   P.setIntensity(brightness);
+  if (displayOff) {
+    P.displayShutdown(true);
+    Serial.println(F("[SETUP] Display restored as OFF"));
+  } else {
+    P.displayShutdown(false);
+  }
   P.setZoneEffect(0, flipDisplay, PA_FLIP_UD);
   P.setZoneEffect(0, flipDisplay, PA_FLIP_LR);
 
@@ -2455,13 +3419,16 @@ void setup() {
   } else {
     Serial.println(F("[SETUP] WiFi state is uncertain after connection attempt."));
   }
-
-  setupMDNS();
+  if (!isAPMode && WiFi.status() == WL_CONNECTED) {
+    setupMDNS();
+  }
   setupWebServer();
   Serial.println(F("[SETUP] Webserver setup complete"));
   Serial.println(F("[SETUP] Setup complete"));
   Serial.println();
+#if !defined(ARDUINO_USB_MODE)
   printConfigToSerial();
+#endif
   setupTime();
   displayMode = 0;
   lastSwitch = millis() - (clockDuration - 500);
@@ -2470,71 +3437,46 @@ void setup() {
   saveUptime();
 }
 
-void ensureHtmlFileExists() {
-  Serial.println(F("[FS] Checking for /index.html on LittleFS..."));
-
-  // Length of embedded HTML in PROGMEM
-  size_t expectedSize = strlen_P(index_html);
-
-  // If the file exists, verify size before deciding to trust it
-  if (LittleFS.exists("/index.html")) {
-    File f = LittleFS.open("/index.html", "r");
-
-    if (!f) {
-      Serial.println(F("[FS] ERROR: /index.html exists but failed to open! Will rewrite."));
-    } else {
-      size_t actualSize = f.size();
-      f.close();
-
-      if (actualSize == expectedSize) {
-        Serial.printf("[FS] /index.html found (size OK: %u bytes). Using file system version.\n", actualSize);
-        return;  // STOP HERE — file is good
-      }
-
-      Serial.printf(
-        "[FS] /index.html size mismatch! Expected %u bytes, found %u. Rewriting...\n",
-        expectedSize, actualSize);
+void advanceDisplayMode() {
+  if (clockOnlyDuringDimming && dimActive) {
+    if (displayMode != 0) {
+      displayMode = 0;
+      Serial.println(F("[DISPLAY] Dimming lock: Forcing Mode 0"));
     }
-  } else {
-    Serial.println(F("[FS] /index.html NOT found. Writing embedded content to LittleFS..."));
-  }
-
-  // -------------------------------
-  // Write embedded HTML to LittleFS
-  // -------------------------------
-
-  File f = LittleFS.open("/index.html", "w");
-  if (!f) {
-    Serial.println(F("[FS] ERROR: Failed to create /index.html for writing!"));
     return;
   }
+  // If user requested clock-only during dimming and we are currently dimmed, stay on clock
+  if (clockOnlyDuringDimming) {
+    time_t now = time(nullptr);
+    struct tm local_tm;
+    localtime_r(&now, &local_tm);
+    int curTotal = local_tm.tm_hour * 60 + local_tm.tm_min;
 
-  size_t htmlLength = expectedSize;
-  size_t bytesWritten = 0;
+    int startTotal = -1, endTotal = -1;
+    bool currentlyDimmed = false;
 
-  for (size_t i = 0; i < htmlLength; i++) {
-    char c = pgm_read_byte_near(index_html + i);
+    if (autoDimmingEnabled) {
+      startTotal = sunsetHour * 60 + sunsetMinute;
+      endTotal = sunriseHour * 60 + sunriseMinute;
+      currentlyDimmed = (startTotal < endTotal)
+                          ? (curTotal >= startTotal && curTotal < endTotal)
+                          : (curTotal >= startTotal || curTotal < endTotal);
+    } else if (dimmingEnabled) {
+      startTotal = dimStartHour * 60 + dimStartMinute;
+      endTotal = dimEndHour * 60 + dimEndMinute;
+      currentlyDimmed = (startTotal < endTotal)
+                          ? (curTotal >= startTotal && curTotal < endTotal)
+                          : (curTotal >= startTotal || curTotal < endTotal);
+    }
 
-    if (f.write((uint8_t *)&c, 1) == 1) {
-      bytesWritten++;
-    } else {
-      Serial.printf("[FS] Write failure at character %u. Aborting write.\n", i);
-      f.close();
+    if (currentlyDimmed) {
+      displayMode = 0;
+      lastSwitch = millis();
+      Serial.println(F("[DISPLAY] advanceDisplayMode(): Staying in CLOCK because Clock-only-dimming is enabled and dimming is active."));
       return;
     }
   }
 
-  f.close();
-
-  if (bytesWritten == htmlLength) {
-    Serial.printf("[FS] Successfully wrote %u bytes to /index.html.\n", bytesWritten);
-  } else {
-    Serial.printf("[FS] WARNING: Only wrote %u of %u bytes to /index.html (might be incomplete).\n",
-                  bytesWritten, htmlLength);
-  }
-}
-
-void advanceDisplayMode() {
   prevDisplayMode = displayMode;
   int oldMode = displayMode;
   String ntpField = String(ntpServer2);
@@ -2576,7 +3518,7 @@ void advanceDisplayMode() {
       displayMode = 2;
       Serial.println(F("[DISPLAY] Switching to display mode: DESCRIPTION (from Weather)"));
     } else if (subwayEnabled) {
-      displayMode = 7;
+      displayMode = 8;
       Serial.println(F("[DISPLAY] Switching to display mode: SUBWAY (from Weather, description skipped)"));
     } else if (countdownEnabled && !countdownFinished && ntpSyncSuccessful && countdownTargetTimestamp > 0 && countdownTargetTimestamp > time(nullptr)) {
       displayMode = 3;
@@ -2590,7 +3532,7 @@ void advanceDisplayMode() {
     }
   } else if (displayMode == 2) {  // Weather Description
     if (subwayEnabled) {
-      displayMode = 7;
+      displayMode = 8;
       Serial.println(F("[DISPLAY] Switching to display mode: SUBWAY (from Description)"));
     } else if (countdownEnabled && !countdownFinished && ntpSyncSuccessful && countdownTargetTimestamp > 0 && countdownTargetTimestamp > time(nullptr)) {
       displayMode = 3;
@@ -2613,7 +3555,7 @@ void advanceDisplayMode() {
   } else if (displayMode == 4) {  // Nightscout -> Custom Message
     displayMode = 6;
     Serial.println(F("[DISPLAY] Switching to display mode: CUSTOM MESSAGE (from Nightscout)"));
-  } else if (displayMode == 7) {  // Subway -> Countdown/Nightscout/Clock
+  } else if (displayMode == 8) {  // Subway (Mode 8) -> Countdown/Nightscout/Clock
     if (countdownEnabled && !countdownFinished && ntpSyncSuccessful && countdownTargetTimestamp > 0 && countdownTargetTimestamp > time(nullptr)) {
       displayMode = 3;
       Serial.println(F("[DISPLAY] Switching to display mode: COUNTDOWN (from Subway)"));
@@ -2624,9 +3566,19 @@ void advanceDisplayMode() {
       displayMode = 0;
       Serial.println(F("[DISPLAY] Switching to display mode: CLOCK (from Subway)"));
     }
-  } else if (displayMode == 6) {  // Custom Message -> Clock
-    displayMode = 0;
-    Serial.println(F("[DISPLAY] Switching to display mode: CLOCK (from Custom Message)"));
+  } else if (displayMode == 6) {  // Custom Message
+    // If Timer is active, return to Mode 7; if Subway enabled, return to Mode 8; else Clock
+    if (timerActive) {
+      displayMode = 7;
+      Serial.println(F("[DISPLAY] Message finished -> Returning to TIMER"));
+    } else if (subwayEnabled) {
+      displayMode = 8;
+      Serial.println(F("[DISPLAY] Message finished -> Returning to SUBWAY"));
+    } else {
+      displayMode = 0;
+      Serial.println(F("[DISPLAY] Message finished -> Returning to CLOCK"));
+    }
+    clockScrollDone = false;
   }
 
   // --- Common cleanup/reset logic remains the same ---
@@ -2640,7 +3592,7 @@ void advanceDisplayMode() {
 
 void advanceDisplayModeSafe() {
   int attempts = 0;
-  const int MAX_ATTEMPTS = 9;  // Number of possible modes + 1 (8 modes total)
+  const int MAX_ATTEMPTS = 10;  // Number of possible modes + 1 (9 modes total: 0-8)
   int startMode = displayMode;
   bool valid = false;
   do {
@@ -2658,7 +3610,8 @@ void advanceDisplayModeSafe() {
     else if (displayMode == 3 && countdownEnabled && !countdownFinished && ntpSyncSuccessful) valid = true;
     else if (displayMode == 4 && nightscoutConfigured) valid = true;
     else if (displayMode == 6 && strlen(customMessage) > 0) valid = true;
-    else if (displayMode == 7 && subwayEnabled) valid = true;
+    else if (displayMode == 7 && timerActive) valid = true;
+    else if (displayMode == 8 && subwayEnabled) valid = true;
 
     // If we've looped back to where we started, break to avoid infinite loop
     if (displayMode == startMode) break;
@@ -2717,10 +3670,134 @@ bool saveCountdownConfig(bool enabled, time_t targetTimestamp, const String &lab
   return true;
 }
 
+bool saveConfigRuntime() {
+
+  DynamicJsonDocument doc(4096);
+
+  File configFile = LittleFS.open("/config.json", "r");
+  if (!configFile) {
+    Serial.println(F("[CONFIG] Failed to open config for reading"));
+    return false;
+  }
+
+  DeserializationError err = deserializeJson(doc, configFile);
+  configFile.close();
+
+  if (err) {
+    Serial.print(F("[CONFIG] JSON parse error: "));
+    Serial.println(err.f_str());
+    return false;
+  }
+
+  // Update only runtime-changing fields
+  doc["brightness"] = brightness;
+  doc["displayOff"] = displayOff;
+  doc["flipDisplay"] = flipDisplay;
+  doc["twelveHourToggle"] = twelveHourToggle;
+  doc["showDayOfWeek"] = showDayOfWeek;
+  doc["showDate"] = showDate;
+  doc["showHumidity"] = showHumidity;
+  doc["colonBlinkEnabled"] = colonBlinkEnabled;
+
+  File configFileWrite = LittleFS.open("/config.json", "w");
+  if (!configFileWrite) {
+    Serial.println(F("[CONFIG] Failed to open config for writing"));
+    return false;
+  }
+
+  serializeJsonPretty(doc, configFileWrite);
+  configFileWrite.close();
+
+  Serial.println(F("[CONFIG] Runtime config saved"));
+  return true;
+}
+
+//Custom font format for days
+String getFormattedDateText(const char *rawText) {
+  String input = String(rawText);
+  String output = "";
+
+  // 1. Detect if it's Japanese/Multi-byte
+  bool isMultiByte = false;
+  for (int i = 0; i < input.length(); i++) {
+    if ((uint8_t)input[i] > 127) {
+      isMultiByte = true;
+      break;
+    }
+  }
+
+  if (isMultiByte) {
+    // Keep Japanese symbols as they are (e.g., "³")
+    output = input;
+  } else {
+    // Determine the separator: \016 for custom, " " for standard
+    String separator = useCustomFont ? "\016" : " ";
+
+    // If standard font, convert to uppercase first (e.g., "tue" -> "TUE")
+    if (!useCustomFont) {
+      input.toUpperCase();
+    }
+
+    // 2. Inject the separator between characters
+    for (int i = 0; i < input.length(); i++) {
+      output += input[i];
+      if (i < input.length() - 1) {
+        output += separator;
+      }
+    }
+  }
+
+  // 3. Add the trailing spaces (M\016O\016N   or T U E  )
+  output += "  ";
+  return output;
+}
 
 void loop() {
+  if (timerActive && (displayMode != 7 && displayMode != 6)) {
+    displayMode = 7;
+    timerSubState = 0;
+    lastSwitch = millis();
+    forceMessageRestart = true;
+  }
+  // 1. REBOOT HANDLER: Execute the restart outside of the Async callback
+  if (pendingRestart && (millis() - restartTimer > 2000)) {
+    Serial.println(F("[SYSTEM] Rebooting now..."));
+    ESP.restart();
+  }
+  // 2. OTA LOCK: If updating, yield to WiFi and stop everything else
+  if (isUpdating) {
+    yield();
+    return;
+  }
   if (isAPMode) {
     dnsServer.processNextRequest();
+    if (credentialsExist()) {
+      static unsigned long apStartTime = 0;
+      if (apStartTime == 0) apStartTime = millis();  // Mark the start time once
+
+      // 3 Minutes = 180000 ms
+      if (millis() - apStartTime > 180000) {
+        Serial.println(F("[WIFI] AP Timeout: Saved credentials found. Rebooting to retry connection..."));
+        delay(500);
+        ESP.restart();
+      }
+    }
+    // AP Mode animation
+    static unsigned long apAnimTimer = 0;
+    static int apAnimFrame = 0;
+    unsigned long now = millis();
+    if (now - apAnimTimer > 750) {
+      apAnimTimer = now;
+      apAnimFrame++;
+    }
+    P.setTextAlignment(PA_CENTER);
+    switch (apAnimFrame % 3) {
+      case 0: P.print(F("\005 ©")); break;
+      case 1: P.print(F("\005 ª")); break;
+      case 2: P.print(F("\005 «")); break;
+    }
+    yield();
+    return;
   }
 
   static bool colonVisible = true;
@@ -2738,26 +3815,6 @@ void loop() {
   const unsigned long fetchInterval = 300000;  // 5 minutes
 
 
-  // AP Mode animation
-  static unsigned long apAnimTimer = 0;
-  static int apAnimFrame = 0;
-  if (isAPMode) {
-    unsigned long now = millis();
-    if (now - apAnimTimer > 750) {
-      apAnimTimer = now;
-      apAnimFrame++;
-    }
-    P.setTextAlignment(PA_CENTER);
-    switch (apAnimFrame % 3) {
-      case 0: P.print(F("= ©")); break;
-      case 1: P.print(F("= ª")); break;
-      case 2: P.print(F("= «")); break;
-    }
-    yield();
-    return;
-  }
-
-
   // -----------------------------
   // Dimming (auto + manual)
   // -----------------------------
@@ -2767,12 +3824,6 @@ void loop() {
   int curHour = timeinfo.tm_hour;
   int curMinute = timeinfo.tm_min;
   int curTotal = curHour * 60 + curMinute;
-
-  // -----------------------------
-  // Determine dimming start/end
-  // -----------------------------
-  int startTotal, endTotal;
-  bool dimActive = false;
 
   if (autoDimmingEnabled) {
     startTotal = sunsetHour * 60 + sunsetMinute;
@@ -2834,6 +3885,15 @@ void loop() {
     P.setIntensity(targetBrightness);
   }
 
+  // Enforce "Clock only during dimming" if enabled
+  if (clockOnlyDuringDimming && dimActive) {
+    if (displayMode != 0) {
+      prevDisplayMode = displayMode;
+      displayMode = 0;
+      lastSwitch = millis();
+      Serial.println(F("[DISPLAY] Forcing CLOCK because 'Clock only during dimming' is enabled and dimming is active."));
+    }
+  }
 
   // --- IMMEDIATE COUNTDOWN FINISH TRIGGER ---
   if (countdownEnabled && !countdownFinished && ntpSyncSuccessful && countdownTargetTimestamp > 0 && now_time >= countdownTargetTimestamp) {
@@ -2979,7 +4039,7 @@ void loop() {
   struct tm displayTimeinfo;
   localtime_r(&display_time, &displayTimeinfo);
 
-  const char *daySymbol = daysOfTheWeek[displayTimeinfo.tm_wday];
+  String daySymbol = getFormattedDateText(daysOfTheWeek[displayTimeinfo.tm_wday]);
 
   // build base HH:MM first (from adjusted display time) ---
   char baseTime[9];
@@ -3016,7 +4076,9 @@ void loop() {
   // build final string ---
   String formattedTime;
   if (showDayOfWeek) {
-    formattedTime = String(daySymbol) + "   " + String(timeSpacedStr);
+    // daySymbol now has either "t\016u\016e  " or "T U E  "
+    // In both cases, the padding is already inside daySymbol.
+    formattedTime = daySymbol + String(timeSpacedStr);
   } else {
     formattedTime = String(timeSpacedStr);
   }
@@ -3041,6 +4103,13 @@ void loop() {
       advanceDisplayModeSafe();
       return;
     }
+    if (forceMessageRestart) {
+      P.displayReset();
+      P.displayClear();
+      forceMessageRestart = false;
+      clockScrollDone = false;  // Ensure it scrolls in
+    }
+    if (forceMessageRestart) return;
     P.setCharSpacing(0);
 
     // --- NTP SYNC ---
@@ -3048,6 +4117,7 @@ void loop() {
       if (ntpSyncSuccessful || ntpRetryCount >= maxNtpRetries || millis() - ntpStartTime > ntpTimeout) {
         ntpState = NTP_FAILED;
       } else if (millis() - ntpAnimTimer > 750) {
+        if (forceMessageRestart) return;
         ntpAnimTimer = millis();
         switch (ntpAnimFrame % 3) {
           case 0: P.print(F("S Y N C ®")); break;
@@ -3059,6 +4129,7 @@ void loop() {
     }
     // --- NTP / WEATHER ERROR ---
     else if (!ntpSyncSuccessful) {
+      if (forceMessageRestart) return;
       P.setTextAlignment(PA_CENTER);
       static unsigned long errorAltTimer = 0;
       static bool showNtpError = true;
@@ -3068,11 +4139,16 @@ void loop() {
           errorAltTimer = millis();
           showNtpError = !showNtpError;
         }
-        P.print(showNtpError ? F("(<") : F("(*"));
+        if (showNtpError) {
+          P.write(2);  // NTP error glyph
+        } else {
+          P.write(1);  // Weather error glyph
+        }
+
       } else if (!ntpSyncSuccessful) {
-        P.print(F("(<"));
+        P.write(2);
       } else if (!weatherAvailable) {
-        P.print(F("(*"));
+        P.write(1);
       }
     }
     // --- DISPLAY CLOCK ---
@@ -3102,8 +4178,16 @@ void loop() {
           0,
           inDir,
           PA_NO_EFFECT);
-        while (!P.displayAnimate()) yield();
-        clockScrollDone = true;  // mark scroll done
+        while (!P.displayAnimate()) {
+          if (forceMessageRestart) {
+            // We are interrupting the scroll, so it is NOT done.
+            clockScrollDone = false;
+            return;  // Exit the clock function immediately
+          }
+          yield();
+        }
+        // Only if we finish the while loop naturally do we mark it done
+        clockScrollDone = true;
       } else {
         P.setTextAlignment(PA_CENTER);
         P.print(timeString);
@@ -3122,6 +4206,7 @@ void loop() {
   // --- WEATHER Display Mode ---
   static bool weatherWasAvailable = false;
   if (displayMode == 1) {
+    if (forceMessageRestart) return;
     P.setCharSpacing(1);
     if (weatherAvailable) {
       String weatherDisplay;
@@ -3146,7 +4231,7 @@ void loop() {
       } else {
         P.setCharSpacing(0);
         P.setTextAlignment(PA_CENTER);
-        P.print(F("(*"));
+        P.write(1);
       }
     }
     yield();
@@ -3156,6 +4241,7 @@ void loop() {
 
   // --- WEATHER DESCRIPTION Display Mode ---
   if (displayMode == 2 && showWeatherDescription && weatherAvailable && weatherDescription.length() > 0) {
+    if (forceMessageRestart) return;
     String desc = weatherDescription;
 
     // --- Check if humidity is actually visible ---
@@ -3187,6 +4273,7 @@ void loop() {
         }
         // wait small pause after scroll stops
         if (millis() - descScrollEndTime > descriptionScrollPause) {
+          if (forceMessageRestart) return;
           descScrolling = false;
           descScrollEndTime = 0;
           advanceDisplayMode();
@@ -3207,6 +4294,7 @@ void loop() {
         descStartTime = 0;
         advanceDisplayMode();
       }
+      if (forceMessageRestart) return;
       yield();
       return;
     }
@@ -3214,7 +4302,7 @@ void loop() {
 
 
   // --- SUBWAY Display Mode ---
-  if (displayMode == 7 && subwayEnabled) {
+  if (displayMode == 8 && subwayEnabled) {
     // Use dynamic text from HA if available, otherwise use placeholder
     // Cache normalized subway text so we only perform the expensive
     // normalizeSubwayText() operation when the underlying text changes.
@@ -3281,6 +4369,7 @@ void loop() {
 
   // --- Countdown Display Mode ---
   if (displayMode == 3 && countdownEnabled && ntpSyncSuccessful) {
+    if (forceMessageRestart) return;
     static int countdownSegment = 0;
     static unsigned long segmentStartTime = 0;
     const unsigned long SEGMENT_DISPLAY_DURATION = 1500;  // 1.5 seconds for each static segment
@@ -3305,7 +4394,7 @@ void loop() {
       }
 
       // Define these static variables here if they are not global (or already defined in your loop())
-      static const char *flashFrames[] = { "{|", "}~" };
+      static const char *flashFrames[] = { "\x08", "\x09" };
       static unsigned long lastFlashingSwitch = 0;
       static int flashingMessageFrame = 0;
 
@@ -3320,6 +4409,7 @@ void loop() {
         const char *hourglassFrames[] = { "¡", "¢", "£", "¤" };
         for (int repeat = 0; repeat < 3; repeat++) {
           for (int i = 0; i < 4; i++) {
+            if (forceMessageRestart) return;
             P.setTextAlignment(PA_CENTER);
             P.setCharSpacing(0);
             P.print(hourglassFrames[i]);
@@ -3345,7 +4435,8 @@ void loop() {
       // --- Continue Flashing "TIMES UP" for its duration (after initial combined sequence) ---
       // This part runs in subsequent loop iterations after the hourglass has played.
       if (millis() - countdownFinishedMessageStartTime < 15000) {  // Flashing duration
-        if (millis() - lastFlashingSwitch >= 500) {                // Check for flashing interval
+        if (forceMessageRestart) return;
+        if (millis() - lastFlashingSwitch >= 500) {  // Check for flashing interval
           lastFlashingSwitch = millis();
           P.displayClear();
           P.setTextAlignment(PA_CENTER);
@@ -3475,6 +4566,7 @@ void loop() {
                 P.displayScroll(label.c_str(), PA_LEFT, actualScrollDirection, GENERAL_SCROLL_SPEED);
 
                 while (!P.displayAnimate()) {
+                  if (forceMessageRestart) return;
                   yield();
                 }
                 countdownSegment++;
@@ -3569,6 +4661,7 @@ void loop() {
 
         // Blocking loop to ensure the full message scrolls
         while (!P.displayAnimate()) {
+          if (forceMessageRestart) break;
           yield();
         }
 
@@ -3589,43 +4682,22 @@ void loop() {
   }  // End of if (displayMode == 3 && ...)
 
 
-  // --- NIGHTSCOUT Display Mode ---
+  // // --- NIGHTSCOUT Display Mode ---
 
   if (displayMode == 4) {
+    if (forceMessageRestart) return;
     String ntpField = String(ntpServer2);
-
-    // These static variables will retain their values between calls to this block
-    static unsigned long lastNightscoutFetchTime = 0;
-    const unsigned long NIGHTSCOUT_FETCH_INTERVAL = 150000;  // 2.5 minutes
-    static int currentGlucose = -1;
-    static String currentDirection = "?";
-    static time_t lastGlucoseTime = 0;  // store timestamp from JSON
-
-    // --- Small helper inside this block ---
-    auto makeTimeUTC = [](struct tm *tm) -> time_t {
-#if defined(ESP32)
-      // ESP32: timegm() is not implemented — emulate correctly
-      struct tm tm_copy = *tm;
-      // mktime() interprets tm as local, but system time is UTC already
-      // so we can safely assume input is UTC
-      return mktime(&tm_copy);
-#elif defined(ESP8266)
-      // ESP8266: timegm() not available either, same logic
-      struct tm tm_copy = *tm;
-      return mktime(&tm_copy);
-#else
-      // Platforms with proper timegm()
-      return timegm(tm);
-#endif
-    };
-    // --------------------------------------
 
     // Check if it's time to fetch new data or if we have no data yet
     if (currentGlucose == -1 || millis() - lastNightscoutFetchTime >= NIGHTSCOUT_FETCH_INTERVAL) {
+      isNetworkBusy = true;
       WiFiClientSecure client;
       client.setInsecure();
       HTTPClient https;
       https.begin(client, ntpField);
+#ifdef ESP8266
+      client.setBufferSizes(512, 512);
+#endif
       https.setTimeout(5000);
 
       Serial.println("[HTTPS] Nightscout fetch initiated...");
@@ -3635,45 +4707,32 @@ void loop() {
         String payload = https.getString();
         StaticJsonDocument<1024> doc;
         DeserializationError error = deserializeJson(doc, payload);
-
         if (!error && doc.is<JsonArray>() && doc.size() > 0) {
           JsonObject firstReading = doc[0].as<JsonObject>();
           currentGlucose = firstReading["glucose"] | firstReading["sgv"] | -1;
           currentDirection = firstReading["direction"] | "?";
-          const char *dateStr = firstReading["dateString"];
-
-          // --- Parse ISO 8601 UTC time ---
-          if (dateStr) {
-            struct tm tm {};
-            if (sscanf(dateStr, "%4d-%2d-%2dT%2d:%2d:%2dZ",
-                       &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
-                       &tm.tm_hour, &tm.tm_min, &tm.tm_sec)
-                == 6) {
-              tm.tm_year -= 1900;
-              tm.tm_mon -= 1;
-              lastGlucoseTime = makeTimeUTC(&tm);
-            }
+          long long dateMs = firstReading["date"] | 0LL;
+          if (dateMs > 0) {
+            lastGlucoseTime = dateMs / 1000;  // ms → seconds (UTC epoch)
           }
-
-          Serial.printf("Nightscout data fetched: %d mg/dL %s\n", currentGlucose, currentDirection.c_str());
+          Serial.printf("Nightscout data fetched: %d mg/dL %s\n",
+                        currentGlucose, currentDirection.c_str());
         } else {
           Serial.println("Failed to parse Nightscout JSON");
         }
       } else {
-        Serial.printf("[HTTPS] GET failed, error: %s\n", https.errorToString(httpCode).c_str());
+        Serial.printf("[HTTPS] GET failed, error: %s\n",
+                      https.errorToString(httpCode).c_str());
       }
-
       https.end();
+      isNetworkBusy = false;
       lastNightscoutFetchTime = millis();
     }
 
     // --- Display the data ---
     if (currentGlucose != -1) {
       // Calculate age of reading
-      // Get current UTC time (avoid local timezone offset)
-      time_t nowLocal = time(nullptr);
-      struct tm *gmt = gmtime(&nowLocal);
-      time_t nowUTC = mktime(gmt);
+      time_t nowUTC = time(nullptr);  // already UTC epoch
 
       bool isOutdated = false;
       int ageMinutes = 0;
@@ -3733,103 +4792,79 @@ void loop() {
 
       P.setTextAlignment(PA_CENTER);
       P.print(displayText.c_str());
-      delay(weatherDuration);
+      unsigned long nightscoutStart = millis();
+      while (millis() - nightscoutStart < weatherDuration) {
+        if (forceMessageRestart) return;  // Kicks out immediately if HA spams
+        yield();
+      }
       advanceDisplayMode();
       return;
     } else {
       P.setTextAlignment(PA_CENTER);
       P.setCharSpacing(0);
-      P.print(F("())"));
-      delay(2000);
+      P.write(15);
+      unsigned long errorStart = millis();
+      while (millis() - errorStart < 2000) {
+        if (forceMessageRestart) return;
+        yield();
+      }
       advanceDisplayMode();
       return;
     }
   }
 
 
-  //DATE Display Mode
+  // DATE Display Mode
   else if (displayMode == 5 && showDate) {
+    if (forceMessageRestart) return;
 
-    // --- VALID DATE CHECK ---
     if (timeinfo.tm_year < 120 || timeinfo.tm_mday <= 0 || timeinfo.tm_mon < 0 || timeinfo.tm_mon > 11) {
       advanceDisplayMode();
-      return;  // skip drawing
+      return;
     }
-    // -------------------------
-    String dateString;
 
-    // Get localized month names
+    // 1. Month uses the custom font logic (lowercase + \016)
     const char *const *months = getMonthsOfYear(language);
-    String monthAbbr = String(months[timeinfo.tm_mon]).substring(0, 5);
-    monthAbbr.toLowerCase();
+    String monthAbbr = getFormattedDateText(months[timeinfo.tm_mon]);
 
-    // Add spaces between day digits
+    // 2. Day digits ALWAYS use standard spaces (" "), never the custom \016
     String dayString = String(timeinfo.tm_mday);
     String spacedDay = "";
     for (size_t i = 0; i < dayString.length(); i++) {
       spacedDay += dayString[i];
-      if (i < dayString.length() - 1) spacedDay += " ";
+      if (i < dayString.length() - 1) {
+        spacedDay += " ";  // Hardcoded standard space
+      }
     }
 
-    // Function to check if day should come first for given language
-    auto isDayFirst = [](const String &lang) {
-      // Languages with DD-MM order
-      const char *dayFirstLangs[] = {
-        "af",  // Afrikaans
-        "cs",  // Czech
-        "da",  // Danish
-        "de",  // German
-        "eo",  // Esperanto
-        "es",  // Spanish
-        "et",  // Estonian
-        "fi",  // Finnish
-        "fr",  // French
-        "ga",  // Irish
-        "hr",  // Croatian
-        "hu",  // Hungarian
-        "it",  // Italian
-        "lt",  // Lithuanian
-        "lv",  // Latvian
-        "nl",  // Dutch
-        "no",  // Norwegian
-        "pl",  // Polish
-        "pt",  // Portuguese
-        "ro",  // Romanian
-        "ru",  // Russian
-        "sk",  // Slovak
-        "sl",  // Slovenian
-        "sr",  // Serbian
-        "sv",  // Swedish
-        "sw",  // Swahili
-        "tr"   // Turkish
-      };
-      for (auto lf : dayFirstLangs) {
-        if (lang.equalsIgnoreCase(lf)) {
-          return true;
-        }
-      }
-      return false;
-    };
+    String dateString;
+    String langStr = String(language);
 
-    String langForDate = String(language);
-
-    if (langForDate == "ja") {
-      // Japanese: month number (spaced digits) + day + symbol
-      String spacedMonth = "";
-      String monthNum = String(timeinfo.tm_mon + 1);
-      dateString = monthAbbr + "  " + spacedDay + " ±";
-
+    if (langStr == "ja") {
+      // Japanese: "1 ²  2 4 ±"
+      dateString = monthAbbr + spacedDay + " ±";
     } else {
-      if (isDayFirst(language)) {
-        dateString = spacedDay + "   " + monthAbbr;
+      auto isDayFirst = [](const String &lang) {
+        const char *dayFirstLangs[] = { "af", "cs", "da", "de", "eo", "es", "et", "fi", "fr", "ga", "hr", "hu", "it", "lt", "lv", "nl", "no", "pl", "pt", "ro", "ru", "sk", "sl", "sr", "sv", "sw", "tr" };
+        for (auto lf : dayFirstLangs) {
+          if (lang.equalsIgnoreCase(lf)) return true;
+        }
+        return false;
+      };
+
+      // monthAbbr already has trailing "  " from your function
+      if (isDayFirst(langStr)) {
+        // Result: "2 4  f\016e\016b  "
+        dateString = spacedDay + "  " + monthAbbr;
       } else {
-        dateString = monthAbbr + "   " + spacedDay;
+        // Result: "f\016e\016b  2 4"
+        dateString = monthAbbr + spacedDay;
       }
     }
 
     P.setTextAlignment(PA_CENTER);
     P.setCharSpacing(0);
-    P.print(dateString);
+    P.print(dateString.c_str());
 
     if (millis() - lastSwitch > weatherDuration) {
       advanceDisplayMode();
@@ -3839,158 +4874,160 @@ void loop() {
 
   // --- Custom Message Display Mode (displayMode == 6) ---
   if (displayMode == 6) {
+    int totalPixelWidth = 0;
 
-    // 1. Initial Check: If message is empty, skip mode 6.
+    if (forceMessageRestart) {
+      P.displayReset();
+      P.displayClear();
+
+      // RESET TIMERS/COUNTERS so new messages start fresh
+      messageStartTime = millis();
+      currentScrollCount = 0;
+      currentDisplayCycleCount = 0;
+
+      forceMessageRestart = false;
+    }
+
     if (strlen(customMessage) == 0) {
       advanceDisplayMode();
       yield();
       return;
     }
 
-    // --- CHARACTER REPLACEMENT AND PADDING (Common to both short and long) ---
-    const size_t MAX_NON_SCROLLING_CHARS = 8;
     String msg = String(customMessage);
 
-    // Replace standard digits 0–9 with your custom font character codes
-    for (int i = 0; i < msg.length(); i++) {
-      if (isDigit(msg[i])) {
-        int num = msg[i] - '0';
-        msg[i] = 145 + ((num + 9) % 10);
+    // --- Strip brackets around numeric tokens ONLY ---
+    if (messageBigNumbers) {
+      while (true) {
+        int start = msg.indexOf('[');
+        int end = msg.indexOf(']', start);
+
+        if (start == -1 || end == -1) break;
+
+        String inside = msg.substring(start + 1, end);
+
+        bool isNumber = true;
+        for (char c : inside) {
+          if (!isdigit(c)) {
+            isNumber = false;
+            break;
+          }
+        }
+
+        if (isNumber) {
+          msg.remove(end, 1);
+          msg.remove(start, 1);
+        } else {
+          break;  // leave icon tokens like [MOON]
+        }
       }
     }
 
-    // --- CHECK FOR TIMEOUT (Applies to temporary short & long messages) ---
-    bool timedOut = false;
-    // Check if a time limit (messageDisplaySeconds > 0) has been exceeded
-    if (messageDisplaySeconds > 0 && (millis() - messageStartTime) >= (messageDisplaySeconds * 1000UL)) {
-      Serial.printf("[MESSAGE] HA message timed out after %d seconds.\n", messageDisplaySeconds);
-      timedOut = true;
+    replaceIconTokens(msg, totalPixelWidth);
+
+    if (!messageBigNumbers) {
+      for (int i = 0; i < msg.length(); i++) {
+        if (isDigit(msg[i])) {
+          int num = msg[i] - '0';
+          msg[i] = 145 + ((num + 9) % 10);
+        }
+      }
     }
 
-    // --- CHECK FOR SCROLL/CYCLE LIMIT BEFORE DISPLAYING ---
-    // Scrolls complete applies to long messages.
-    bool scrollsComplete = (messageScrollTimes > 0) && (currentScrollCount >= messageScrollTimes);
+    // --- TIMEOUT & LIMIT CHECKS ---
+    bool timedOut = (messageDisplaySeconds > 0 && (millis() - messageStartTime) >= (messageDisplaySeconds * 1000UL));
+    bool scrollsComplete = (messageScrollTimes > 0 && currentScrollCount >= messageScrollTimes);
+    bool cyclesComplete = (messageScrollTimes > 0 && currentDisplayCycleCount >= messageScrollTimes);
 
-    // Cycles complete applies to short messages.
-    extern int currentDisplayCycleCount;  // Use the dedicated short message counter
-    bool cyclesComplete = (messageScrollTimes > 0) && (currentDisplayCycleCount >= messageScrollTimes);
-
-
-    // --- ADVANCE MODE CHECK (Check if HA parameters are complete) ---
-    // If either timer or cycle/scroll count is finished, we clean up the temporary message.
-    if (scrollsComplete || cyclesComplete) {
-      Serial.println(F("[MESSAGE] HA-controlled message finished."));
-
-      // Reset common counters
-      currentScrollCount = 0;
-      messageStartTime = 0;
-      currentDisplayCycleCount = 0;  // Reset the cycle counter
-
-      // CRITICAL LOGIC: RESTORE PERSISTENT MESSAGE (Exit Mode 6 Logic)
+    if (timedOut || scrollsComplete || cyclesComplete) {
+      allowInterrupt = true;
       if (strlen(lastPersistentMessage) > 0) {
-        // A persistent message exists, restore it
         strncpy(customMessage, lastPersistentMessage, sizeof(customMessage));
         messageScrollSpeed = GENERAL_SCROLL_SPEED;
-        messageDisplaySeconds = 0;
-        messageScrollTimes = 0;
-        Serial.printf("[MESSAGE] Restored persistent message: '%s'. Staying in mode 6.\n", customMessage);
       } else {
-        // No persistent message to restore. Clear the temporary HA message and Exit mode 6.
         customMessage[0] = '\0';
-        Serial.println(F("[MESSAGE] No persistent message to restore. Advancing display mode."));
+      }
+      currentScrollCount = 0;
+      messageStartTime = 0;
+      currentDisplayCycleCount = 0;
+      messageDisplaySeconds = 0;
+      messageScrollTimes = 0;
+      prevDisplayMode = 6;  // Set for Clock scroll-in
+      advanceDisplayMode();
+      yield();
+      return;
+    }
+
+    // --- BRANCH A: STATIC (0-32 pixels) ---
+    if (totalPixelWidth <= 32) {
+      unsigned long durationMs = (messageDisplaySeconds > 0) ? (messageDisplaySeconds * 1000UL) : weatherDuration;
+
+      // 1. Initial Centered Display
+      P.setTextAlignment(PA_CENTER);
+      P.setCharSpacing(1);
+      P.print(msg.c_str());
+
+      unsigned long displayUntil = millis() + durationMs;
+      while (millis() < displayUntil) {
+        if (forceMessageRestart) return;
+        yield();
+      }
+
+      // 2. THE MANUAL SHIFT (Create 4-5px of pure black)
+      if (totalPixelWidth >= 27) {
+        // Shift the internal pixel buffer to the left 5 times
+        for (uint8_t i = 0; i < 5; i++) {
+          // TSL = Transform Shift Left.
+          // This moves the actual dots on the screen.
+          P.getGraphicObject()->transform(MD_MAX72XX::TSL);
+
+          delay(messageScrollSpeed);
+        }
+      }
+
+      // 3. Handover to Clock
+      if (messageScrollTimes > 0) {
+        currentDisplayCycleCount++;
+      } else {
+        prevDisplayMode = 6;
         advanceDisplayMode();
       }
       yield();
       return;
     }
 
-    // ----------------------------------------------------------------------
-    // BRANCH A: NON-SCROLLING (Short Message: strlen <= 8)
-    // ----------------------------------------------------------------------
-    if (msg.length() <= MAX_NON_SCROLLING_CHARS) {
-
-      // Determine the duration: use HA seconds if set, otherwise use weatherDuration.
-      unsigned long durationMs = (messageDisplaySeconds > 0)
-                                   ? (messageDisplaySeconds * 1000UL)
-                                   : weatherDuration;
-
-      // If HA seconds is set, we use the timedOut check at the top.
-      // If only scrollTimes is set, we still display for weatherDuration before incrementing the cycle count.
-
-      Serial.printf("[MESSAGE] Displaying timed short message: '%s' for %lu ms. Advancing mode.\n", customMessage, durationMs);
-
-      P.setTextAlignment(PA_CENTER);
-      P.setCharSpacing(1);
-      P.print(msg.c_str());
-
-      // Block execution for the specified duration (non-HA uses weatherDuration)
-      unsigned long displayUntil = millis() + durationMs;
-      while (millis() < displayUntil) {
-        yield();
-      }
-
-      // --- CYCLE TRACKING FOR SCROLLTIMES ---
-      // Increment the counter if the HA message is configured to clear by scroll count.
-      if (messageScrollTimes > 0) {
-        currentDisplayCycleCount++;
-        Serial.printf("[MESSAGE] Short message cycle complete. Count: %d/%d\n", currentDisplayCycleCount, messageScrollTimes);
-      }
-
-      // After display, the message content must persist, but the display must cycle.
-      Serial.println(F("[MESSAGE] Short message duration complete. Advancing display mode."));
-      advanceDisplayMode();
-      yield();
-      return;
-    }
-
-    // ----------------------------------------------------------------------
-    // BRANCH B: SCROLLING (Long Message: strlen > 8) - (Existing Logic)
-    // ----------------------------------------------------------------------
-
-    // --- Determine if we need left padding based on previous mode ---
+    // --- BRANCH B: SCROLLING ---
     bool addPadding = false;
     bool humidityVisible = showHumidity && weatherAvailable && strlen(openWeatherApiKey) == 32 && strlen(openWeatherCity) > 0 && strlen(openWeatherCountry) > 0;
+    if (prevDisplayMode == 0 && (showDayOfWeek || colonBlinkEnabled)) addPadding = true;
+    else if (prevDisplayMode == 1 && humidityVisible) addPadding = true;
 
-    // If coming from CLOCK mode
-    if (prevDisplayMode == 0 && (showDayOfWeek || colonBlinkEnabled)) {
-      addPadding = true;
-    } else if (prevDisplayMode == 1 && humidityVisible) {
-      addPadding = true;
-    }
-    // Apply padding (4 spaces) if needed
-    if (addPadding) {
-      msg = "    " + msg;
-    }
+    if (addPadding) msg = "    " + msg;
 
-    // --- Display scrolling message ---
     P.setTextAlignment(PA_LEFT);
     P.setCharSpacing(1);
     textEffect_t actualScrollDirection = getEffectiveScrollDirection(PA_SCROLL_LEFT, flipDisplay);
-    extern int messageScrollSpeed;
 
-    // START SCROLL CYCLE
     P.displayScroll(msg.c_str(), PA_LEFT, actualScrollDirection, messageScrollSpeed);
 
-    // BLOCKING WAIT: Completes 1 full scroll
-    while (!P.displayAnimate()) yield();
-
-    // SCROLL COUNT INCREMENT
-    if (messageScrollTimes > 0) {
-      currentScrollCount++;
-      Serial.printf("[MESSAGE] Scroll complete. Count: %d/%d\n", currentScrollCount, messageScrollTimes);
+    while (!P.displayAnimate()) {
+      if (forceMessageRestart) return;  // Exit immediately to top level
+      yield();
     }
 
-    // If no HA parameters are set, this is a persistent/infinite scroll, so advance mode after 1 scroll cycle.
-    // If HA parameters ARE set, the mode relies on the check at the top to break out.
+    currentScrollCount++;
+
     if (messageDisplaySeconds == 0 && messageScrollTimes == 0) {
-      P.setTextAlignment(PA_CENTER);
+      prevDisplayMode = 6;
       advanceDisplayMode();
     }
-
     yield();
     return;
   }
 
+  if (displayMode == 7) {
+    showTimerMode7();
+  }
 
   unsigned long currentMillis = millis();
   unsigned long runtimeSeconds = (currentMillis - bootMillis) / 1000;
@@ -3999,6 +5036,13 @@ void loop() {
   // --- Log and save uptime every 10 minutes ---
   const unsigned long uptimeLogInterval = 600000UL;  // 10 minutes in ms
 
+  // ---- CONFIG AUTO SAVE ----
+  if (configDirty && millis() - lastBrightnessChange > saveDelay) {
+    saveConfigRuntime();
+    configDirty = false;
+    Serial.println("[CONFIG] Auto-saved");
+  }
+
   if (currentMillis - lastUptimeLog >= uptimeLogInterval) {
     lastUptimeLog = currentMillis;
     Serial.printf("[UPTIME] Runtime: %s (total %.2f hours)\n",
@@ -4006,4 +5050,75 @@ void loop() {
     saveUptime();  // Save accumulated uptime every 10 minutes
   }
   yield();
+}
+
+void showTimerMode7() {
+  unsigned long now = millis();
+  P.setCharSpacing(1);
+  // --- 1. INTERRUPT LOGIC ---
+  // Updated to use allowInterrupt check as requested
+  if (allowInterrupt == false) {
+    unsigned long waitTime = (unsigned long)clockDuration;
+    // Wait for the specified clockDuration to elapse before switching
+    if (now - lastSwitch >= waitTime) {
+      Serial.println(F("[TIMER] clockDuration reached. Switching to Mode 6 (Infinite)"));
+      displayMode = 6;
+      lastSwitch = now;
+      return;
+    }
+  }
+
+  // 2. Timer Logic
+  if (!timerFinished) {
+    long remaining = 0;
+    if (timerPaused) {
+      remaining = (long)(timerRemainingAtPause / 1000);
+    } else {
+      if (now >= timerEndTime) {
+        timerFinished = true;
+        timerFinishStartTime = now;
+      } else {
+        remaining = (long)((timerEndTime - now) / 1000);
+        if (remaining < 0) remaining = 0;
+
+        int h = remaining / 3600;
+        int m = (remaining % 3600) / 60;
+        int s = remaining % 60;
+
+        char buf[12];
+        if (h > 0) sprintf(buf, "%02d:%02d:%02d", h, m, s);
+        else sprintf(buf, "%02d:%02d", m, s);
+
+        P.setTextAlignment(PA_CENTER);
+        P.print(buf);
+        return;
+      }
+    }
+
+    if (timerPaused) {
+      int h = remaining / 3600;
+      int m = (remaining % 3600) / 60;
+      int s = remaining % 60;
+      char buf[12];
+      if (h > 0) sprintf(buf, "%02d:%02d:%02d", h, m, s);
+      else sprintf(buf, "%02d:%02d", m, s);
+      P.setTextAlignment(PA_CENTER);
+      P.print(buf);
+      return;
+    }
+  }
+
+  // 3. Finished State (Alarm Animation)
+  if (timerFinished) {
+    if (now - timerFinishStartTime > 5000) {
+      timerActive = false;
+      timerFinished = false;
+      displayMode = 0;
+      clockScrollDone = false;
+      lastSwitch = now;
+      return;
+    }
+    if ((now / 500) % 2 == 0) P.print("\x08");
+    else P.print("\x09");
+  }
 }

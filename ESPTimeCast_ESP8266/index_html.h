@@ -525,6 +525,14 @@ textarea::placeholder {
     <div class="toggles" style="padding: 0 1rem;">
 
       <label style="display: flex; align-items: center; margin-top: 1.75rem; justify-content: space-between;">
+        <span style="margin-right: 0.5em;">Show Clock:</span>
+        <span class="toggle-switch">
+          <input type="checkbox" id="showClock" name="showClock" onchange="setShowClock(this.checked)">
+          <span class="toggle-slider"></span>
+        </span>
+      </label>
+
+      <label style="display: flex; align-items: center; margin-top: 1.75rem; justify-content: space-between;">
         <span style="margin-right: 0.5em;">Show Day Of The Week:</span>
         <span class="toggle-switch">
           <input type="checkbox" id="showDayOfWeek" name="showDayOfWeek" onchange="setShowDayOfWeek(this.checked)">
@@ -788,6 +796,7 @@ window.onload = function () {
     document.getElementById('ntpServer1').value = data.ntpServer1 || "";
     document.getElementById('ntpServer2').value = data.ntpServer2 || "";
     document.getElementById('twelveHourToggle').checked = !!data.twelveHourToggle;
+    document.getElementById('showClock').checked = (data.showClock !== false);
     document.getElementById('showDayOfWeek').checked = !!data.showDayOfWeek;
     document.getElementById('showDate').checked = !!data.showDate;
     document.getElementById('showHumidity').checked = !!data.showHumidity;
@@ -944,6 +953,7 @@ async function submitConfig(event) {
   formData.set('brightness', document.getElementById('brightnessSlider').value);
   formData.set('flipDisplay', document.getElementById('flipDisplay').checked ? 'on' : '');
   formData.set('twelveHourToggle', document.getElementById('twelveHourToggle').checked ? 'on' : '');
+  formData.set('showClock', document.getElementById('showClock').checked ? 'on' : '');
   formData.set('showDayOfWeek', document.getElementById('showDayOfWeek').checked ? 'on' : '');
   formData.set('showDate', document.getElementById('showDate').checked ? 'on' : '');
   formData.set('showHumidity', document.getElementById('showHumidity').checked ? 'on' : '');
@@ -1295,6 +1305,14 @@ function setShowDayOfWeek(val) {
 
 function setShowDate(val) {
   fetch('/set_showdate', {
+    method: 'POST',
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: "value=" + (val ? 1 : 0)
+  });
+}
+
+function setShowClock(val) {
+  fetch('/set_showclock', {
     method: 'POST',
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: "value=" + (val ? 1 : 0)

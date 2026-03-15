@@ -65,6 +65,7 @@ bool flipDisplay = false;
 bool twelveHourToggle = false;
 bool showDayOfWeek = true;
 bool showDate = false;
+bool showClock = true;  // Show clock display (mode 0)
 bool showHumidity = false;
 bool colonBlinkEnabled = true;
 char ntpServer1[64] = "pool.ntp.org";
@@ -252,6 +253,7 @@ void loadConfig() {
     doc[F("twelveHourToggle")] = twelveHourToggle;
     doc[F("showDayOfWeek")] = showDayOfWeek;
     doc[F("showDate")] = false;
+    doc[F("showClock")] = showClock;
     doc[F("showHumidity")] = showHumidity;
     doc[F("colonBlinkEnabled")] = colonBlinkEnabled;
     doc[F("ntpServer1")] = ntpServer1;
@@ -329,6 +331,7 @@ void loadConfig() {
   timeOffsetMinutes = doc["timeOffsetMinutes"] | 0;
   showDayOfWeek = doc["showDayOfWeek"] | true;
   showDate = doc["showDate"] | false;
+  showClock = doc["showClock"] | true;
   showHumidity = doc["showHumidity"] | false;
   colonBlinkEnabled = doc.containsKey("colonBlinkEnabled") ? doc["colonBlinkEnabled"].as<bool>() : true;
   showWeatherDescription = doc["showWeatherDescription"] | false;
@@ -613,6 +616,8 @@ void printConfigToSerial() {
   Serial.println(twelveHourToggle ? "Yes" : "No");
   Serial.print(F("Show Day of the Week: "));
   Serial.println(showDayOfWeek ? "Yes" : "No");
+  Serial.print(F("Show Clock: "));
+  Serial.println(showClock ? "Yes" : "No");
   Serial.print(F("Show Date: "));
   Serial.println(showDate ? "Yes" : "No");
   Serial.print(F("Show Weather Description: "));
@@ -791,6 +796,7 @@ void setupWebServer() {
       else if (n == "twelveHourToggle") doc[n] = (v == "true" || v == "on" || v == "1");
       else if (n == "showDayOfWeek") doc[n] = (v == "true" || v == "on" || v == "1");
       else if (n == "showDate") doc[n] = (v == "true" || v == "on" || v == "1");
+      else if (n == "showClock") doc[n] = (v == "true" || v == "on" || v == "1");
       else if (n == "showHumidity") doc[n] = (v == "true" || v == "on" || v == "1");
       else if (n == "colonBlinkEnabled") doc[n] = (v == "true" || v == "on" || v == "1");
       else if (n == "dimStartHour") doc[n] = v.toInt();
@@ -1094,6 +1100,21 @@ void setupWebServer() {
     }
     showDate = showDateVal;
     Serial.printf("[WEBSERVER] Set showDate to %d\n", showDate);
+    request->send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/set_showclock", HTTP_POST, [](AsyncWebServerRequest *request) {
+    bool showClockVal = true;
+    if (request->hasParam("value", true)) {
+      String v = request->getParam("value", true)->value();
+      showClockVal = (v == "1" || v == "true" || v == "on");
+    }
+    if (showClock == true && showClockVal == false && displayMode == 0) {
+      Serial.println(F("[WEBSERVER] showClock toggled OFF while in Clock mode. Forcing mode advance."));
+      advanceDisplayModeSafe();
+    }
+    showClock = showClockVal;
+    Serial.printf("[WEBSERVER] Set showClock to %d\n", showClock);
     request->send(200, "application/json", "{\"ok\":true}");
   });
 
@@ -2633,7 +2654,7 @@ void advanceDisplayModeSafe() {
     String ntpField = String(ntpServer2);
     bool nightscoutConfigured = ntpField.startsWith("https://");
 
-    if (displayMode == 0) valid = true;  // Clock always valid
+    if (displayMode == 0 && showClock) valid = true;
     else if (displayMode == 5 && showDate) valid = true;
     else if (displayMode == 1 && weatherAvailable && (strlen(openWeatherApiKey) == 32) && (strlen(openWeatherCity) > 0) && (strlen(openWeatherCountry) > 0)) valid = true;
     else if (displayMode == 2 && showWeatherDescription && weatherAvailable && weatherDescription.length() > 0) valid = true;
@@ -3019,6 +3040,10 @@ void loop() {
 
   // --- CLOCK Display Mode ---
   if (displayMode == 0) {
+    if (!showClock) {
+      advanceDisplayModeSafe();
+      return;
+    }
     P.setCharSpacing(0);
 
     // --- NTP SYNC ---

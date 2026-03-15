@@ -15,7 +15,7 @@ ESPTimeCast is a WiFi-connected LED matrix clock and weather display for ESP8266
 ### Global State & Display Loop Architecture
 - **No objects for config**: Settings stored as individual global variables (ssid[], brightness, dimmingEnabled, etc.), loaded from LittleFS JSON via `loadConfig()`
 - **Display mode cycle**: Modes 0-1 (clock/weather) auto-advance with `advanceDisplayMode()` after `clockDuration`/`weatherDuration` milliseconds
-- **Display modes**: 0=Clock, 1=Weather (temp), 2=Weather Description, 3=Countdown, 4-6=Custom Messages (persistent from Web UI)
+- **Display modes**: 0=Clock, 1=Weather (temp), 2=Weather Description, 3=Countdown, 4=Nightscout, 5=Date, 6=Custom Message, 7=Timer, 8=Subway
 - **Timer-based switching**: `millis() - lastSwitch > duration` pattern controls when to advance; no task scheduler
 - **Volatile state**: `lastSwitch`, `currentScrollCount`, `messageStartTime` track animation progress and must be reset when mode changes
 
@@ -27,13 +27,13 @@ ESPTimeCast is a WiFi-connected LED matrix clock and weather display for ESP8266
 ### MD_Parola Display Library Usage
 - `P.displayText()` queues scrolling animation (non-blocking)
 - `P.displayAnimate()` advances animation; must call in loop every iteration
-- Custom font from `mfactoryfont.h` uses `&` as escape for special characters (e.g., `"s&u&n"` → "SUN" with special U)
+- Custom font from `basic_font.h` (replaced `mfactoryfont.h` in v1.4.1) uses `&` as escape for special characters (e.g., `"s&u&n"` → "SUN" with special U)
 - 4 MAX7219 devices chained = 8x32 display; brightness 0-15, -1=display off
 
 ## Key Files
 - **Main sketches**: [ESPTimeCast_ESP32/ESPTimeCast_ESP32.ino](ESPTimeCast_ESP32/ESPTimeCast_ESP32.ino), [ESPTimeCast_ESP8266/ESPTimeCast_ESP8266.ino](ESPTimeCast_ESP8266/ESPTimeCast_ESP8266.ino) (3710 lines each, must stay in sync)
 - **Web UI**: [index_html.h](ESPTimeCast_ESP32/index_html.h) (embedded PROGMEM HTML/CSS/JS, form POSTs to `/set_custom_message`, `/set_brightness`, etc.)
-- **Custom font**: [mfactoryfont.h](ESPTimeCast_ESP32/mfactoryfont.h) (8x8 pixel char bitmaps with `&` escape encoding)
+- **Custom font**: [basic_font.h](ESPTimeCast_ESP32/basic_font.h) (8x8 pixel char bitmaps with `&` escape encoding; replaced `mfactoryfont.h` in v1.4.1)
 - **I18N data**: [days_lookup.h](ESPTimeCast_ESP32/days_lookup.h), [months_lookup.h](ESPTimeCast_ESP32/months_lookup.h), [tz_lookup.h](ESPTimeCast_ESP32/tz_lookup.h) (language maps, IANA timezones)
 - **Config storage**: `/config.json` (LittleFS, auto-created from defaults on first boot)
 
@@ -49,7 +49,7 @@ ESPTimeCast is a WiFi-connected LED matrix clock and weather display for ESP8266
    - `MD_Parola` + `MD_MAX72xx` (majicDesigns) — LED matrix control
    - `ESPAsyncWebServer` (3.9.1+) + `AsyncTCP`/`ESPAsyncTCP` — Web server
 4. **Configure partition scheme**:
-   - ESP32: Set "Partition Scheme" → "No OTA (2MB APP/2MB SPIFFS)"
+   - ESP32: Set "Partition Scheme" → "Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)" or any 2-partition OTA scheme
    - ESP8266: Set "Flash Size" → "4MB FS:2MB OTA" (ensures 2MB LittleFS)
 5. **Upload sketch**: Click Upload button. **No separate LittleFS upload needed** — web UI is embedded in sketch as `index_html.h`
 
@@ -178,7 +178,7 @@ All POST endpoints save to config and trigger `saveConfig()`:
 
 ## Common Tasks
 ### Adding New Display Mode
-1. Define new `displayMode` value (currently 0-7 used; next = 8)
+1. Define new `displayMode` value (currently 0-8 used; next = 9)
 2. Add case in main loop `loop()` function
 3. Initialize mode state in `advanceDisplayMode()` (reset timers, `lastSwitch`, scroll counters)
 4. Add logic to `P.displayAnimate()` or `P.displayText()` calls
@@ -214,7 +214,7 @@ All POST endpoints save to config and trigger `saveConfig()`:
 - **ESP32**: Uses `WiFi.h`, `HTTPClient.h`, event callbacks (`WiFi.onEvent()`)
 - **ESP8266**: Uses `ESP8266WiFi.h`, `ESP8266HTTPClient.h`, event handlers (`WiFiEventHandler`)
 - **Pin numbers differ significantly** but functionally equivalent; verify pin constants at sketch top
-- **Partition schemes optimized**: ESP32 uses "No OTA (2MB APP/2MB SPIFFS)", ESP8266 uses "4MB FS:2MB OTA"
+- **Partition schemes optimized**: ESP32 uses an OTA-capable partition scheme (v1.4.1+ adds OTA support), ESP8266 uses "4MB FS:2MB OTA"
 - **timegm() missing**: Both platforms lack standard timegm(); custom emulation in sketch for countdown timestamp handling
 - **mDNS**: Both support, but registered differently (see sketch initialization)
 
